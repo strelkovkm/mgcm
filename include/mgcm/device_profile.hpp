@@ -46,8 +46,9 @@ struct DeviceProfile {
     double   pi_fma_gflops         = 0.0;
     double   pi_gelu_tanh_gelem_s  = 0.0;
     double   pi_gelu_erf_gelem_s   = 0.0;
-    uint32_t g_half_workgroups     = 1;
-    uint32_t g_sat_workgroups      = 1;
+    uint32_t g_wave_quantum    = 1;
+    uint32_t g_half_workgroups = 1;
+    uint32_t g_sat_workgroups  = 1;
     std::vector<WaveSaturationPoint> wave_curve;
 
     // MB6: Uncached Driver Compilation + Lazy First-Infer JIT

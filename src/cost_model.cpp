@@ -39,8 +39,12 @@ PlanEstimate CostModel::estimate_plan(const SubgraphQuery& q, PartitionPlan plan
     uint32_t wg_n = (q.N + 63u) / 64u;
     double num_wgs = q.tiled_matmul ? static_cast<double>(wg_m * wg_n) : std::ceil((M * N) / 256.0);
 
-    double g_half = static_cast<double>(std::max<uint32_t>(1u, prof_.g_half_workgroups));
-    double eta_occ = num_wgs / (num_wgs + g_half);
+    double g_wave     = static_cast<double>(std::max<uint32_t>(1u, prof_.g_wave_quantum));
+    double n_waves    = std::max(1.0, std::ceil(num_wgs / g_wave));
+    double eta_quant  = num_wgs / (g_wave * n_waves);
+    double w_sat      = std::max(1.0, static_cast<double>(prof_.g_sat_workgroups) / g_wave);
+    double eta_lat    = n_waves / (n_waves + 0.25 * (w_sat - 1.0));
+    double eta_occ    = std::clamp(eta_quant * eta_lat, 1e-3, 1.0);
 
     double sustained_gemm_gflops = q.tiled_matmul
                                        ? (prof_.prefer_shared_mem ? prof_.gflops_matmul_smem : prof_.gflops_matmul_cache)

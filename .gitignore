@@ -1,4 +1,6 @@
 build*/
-results/
+results*/
+*.csv
+*.png
 .cache/
 compile_commands.json

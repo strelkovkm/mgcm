@@ -1,7 +1,7 @@
 struct StreamParams {
-    uint  num_vec4;
-    uint  steps;
-    uint  num_groups;
+    uint  num_blocks;
+    uint  passes_per_sweep;
+    uint  sweeps;
     float impossible_sink;
 };
 [[vk::push_constant]] StreamParams pc;
@@ -11,17 +11,18 @@ struct StreamParams {
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void mb2_stream_vec4(uint3 gid : SV_GroupID, uint3 ltid : SV_GroupThreadID, uint3 dtid : SV_DispatchThreadID) {
-    // Stagger workgroup start offsets across [0, num_vec4) aligned to 256 vec4 (4 KB)
-    uint wg_offset = uint(((uint64_t(gid.x) * uint64_t(pc.num_vec4)) / uint64_t(pc.num_groups)) & ~255ull);
-    uint idx = (wg_offset + ltid.x) % pc.num_vec4;
     float4 acc = float4(0.0f, 0.0f, 0.0f, 0.0f);
 
     [loop]
-    for (uint s = 0; s < pc.steps; ++s) {
-        acc += src_buf[idx];
-        idx += 256u;
-        if (idx >= pc.num_vec4) {
-            idx -= pc.num_vec4;
+    for (uint r = 0; r < pc.sweeps; ++r) {
+        uint base_blk = (gid.x + r * 17u) % pc.num_blocks;
+        [loop]
+        for (uint p = 0; p < pc.passes_per_sweep; ++p) {
+            uint blk = base_blk + p * 128u;
+            if (blk >= pc.num_blocks) {
+                blk -= pc.num_blocks;
+            }
+            acc += src_buf[blk * 256u + ltid.x];
         }
     }
 

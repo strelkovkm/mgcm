@@ -377,6 +377,20 @@ void Calibrator::run_mb5_compute_and_waves(DeviceProfile& out) {
         out.wave_curve.push_back({g, gf, med_ns * 1e-3});
     }
 
+    // Detect hardware wave quantum from the first discrete step jump (>1.35x) in GPU execution time
+    out.g_wave_quantum = grid_sizes.front();
+    if (out.wave_curve.size() >= 2) {
+        double base_us = out.wave_curve.front().gpu_time_us;
+        for (size_t i = 0; i + 1 < out.wave_curve.size(); ++i) {
+            double curr_us = out.wave_curve[i].gpu_time_us;
+            double next_us = out.wave_curve[i + 1].gpu_time_us;
+            if (next_us > 1.35 * curr_us && next_us > 1.35 * base_us) {
+                out.g_wave_quantum = out.wave_curve[i].workgroups;
+                break;
+            }
+        }
+    }
+
     out.g_half_workgroups = grid_sizes.back();
     out.g_sat_workgroups  = grid_sizes.back();
     for (const auto& pt : out.wave_curve) {
@@ -395,8 +409,7 @@ void Calibrator::run_mb5_compute_and_waves(DeviceProfile& out) {
     if (cfg_.verbose) {
         std::cout << std::setprecision(2) << "[MB5 Compute] Peak FMA = " << out.pi_fma_gflops
                   << " GFLOPS | GELU_TANH = " << out.pi_gelu_tanh_gelem_s
-                  << " GElem/s | GELU_ERF = " << out.pi_gelu_erf_gelem_s << " GElem/s | G_half = "
-                  << out.g_half_workgroups << " WGs, G_sat(85%) = " << out.g_sat_workgroups << " WGs\n";
+                  << " GElem/s | GELU_ERF = " << out.pi_gelu_erf_gelem_s << " GElem/s | G_wave = " << out.g_wave_quantum << " WGs, G_half = " << out.g_half_workgroups << " WGs, G_sat(85%) = " << out.g_sat_workgroups << " WGs\n";
     }
 
     backend_.destroy_kernel(krn_erf);
@@ -539,6 +552,7 @@ std::string Calibrator::to_json_string(const DeviceProfile& p) {
     j["mb5_compute"]    = {{"pi_fma_gflops", p.pi_fma_gflops},
                            {"pi_gelu_tanh_gelem_s", p.pi_gelu_tanh_gelem_s},
                            {"pi_gelu_erf_gelem_s", p.pi_gelu_erf_gelem_s},
+                           {"g_wave_quantum", p.g_wave_quantum},
                            {"g_half_workgroups", p.g_half_workgroups},
                            {"g_sat_workgroups", p.g_sat_workgroups}};
     j["mb6_compile"]    = {{"small_cpu_ms", p.t_compile_small_cpu_ms},
@@ -612,6 +626,7 @@ DeviceProfile Calibrator::from_json_string(const std::string& json_text) {
     p.pi_fma_gflops         = j5.value("pi_fma_gflops", 1000.0);
     p.pi_gelu_tanh_gelem_s  = j5.value("pi_gelu_tanh_gelem_s", 100.0);
     p.pi_gelu_erf_gelem_s   = j5.value("pi_gelu_erf_gelem_s", 100.0);
+    p.g_wave_quantum        = j5.value("g_wave_quantum", j5.value("g_half_workgroups", 1u));
     p.g_half_workgroups     = j5.value("g_half_workgroups", 1u);
     p.g_sat_workgroups      = j5.value("g_sat_workgroups", 1u);
 

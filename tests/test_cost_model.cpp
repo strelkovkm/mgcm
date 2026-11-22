@@ -25,6 +25,7 @@ mgcm::DeviceProfile make_synthetic_780m() {
     p.pi_fma_gflops              = 4085.0;
     p.pi_gelu_tanh_gelem_s       = 134.5;
     p.pi_gelu_erf_gelem_s        = 162.6;
+    p.g_wave_quantum             = 6;
     p.g_half_workgroups          = 6;
     p.g_sat_workgroups           = 24;
     p.t_compile_small_cpu_ms     = 0.25;
@@ -70,6 +71,15 @@ int main() {
     auto e_tiled   = cm.estimate_plan(q_whisper_tiled, mgcm::PartitionPlan::P3_FullFusion);
     assert(e_untiled.t_execute_us > 1500000.0); // > 1.5s TDR danger zone!
     assert(e_tiled.t_execute_us < 25000.0);     // < 25 ms with 2D tiling!
+
+    // 6. Wave quantization tail effect: 384x384 (6x6 = 36 WGs = 6 full waves of 6) vs 448x384 (7x6 = 42 WGs = 7 full waves) vs 448x448 (49 WGs -> 9th partial wave!)
+    mgcm::DeviceProfile p_36sm = p1;
+    p_36sm.g_wave_quantum   = 36;
+    p_36sm.g_sat_workgroups = 36;
+    mgcm::CostModel cm36(p_36sm);
+    auto e_36wg = cm36.estimate_plan({384, 384, 512, false, mgcm::GeluKind::Erf, true, true}, mgcm::PartitionPlan::P3_FullFusion); // 6x6 = 36 WGs (1 full wave)
+    auto e_42wg = cm36.estimate_plan({448, 384, 512, false, mgcm::GeluKind::Erf, true, true}, mgcm::PartitionPlan::P3_FullFusion); // 7x6 = 42 WGs (spills into 2nd wave!)
+    assert(e_42wg.t_compute_us > 1.75 * e_36wg.t_compute_us);
 
     std::cout << "[PASS] All CostModel unit tests passed! (R* sample = " << r_star
               << ", Whisper untiled = " << (e_untiled.t_execute_us * 1e-3)

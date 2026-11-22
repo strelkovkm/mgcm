@@ -62,6 +62,9 @@ SpirvReflection parse_and_validate_canonical_abi(std::vector<uint32_t>& words, u
         uint16_t op  = static_cast<uint16_t>(words[i] & 0xFFFFu);
         if (len == 0 || i + len > words.size()) throw std::runtime_error("Corrupt SPIR-V stream");
 
+        if (op == 17 && len >= 2 && words[i + 1] == 11) {
+            throw std::runtime_error("ABI violation: OpCapability Int64 is forbidden for mobile GPU portability");
+        }
         if (op == 17 && len >= 2 && words[i + 1] == 1) has_shader_cap = true; // OpCapability Shader
         else if (op == 15) { // OpEntryPoint
             if (words[i + 1] == 5) ++entry_points; // GLCompute
