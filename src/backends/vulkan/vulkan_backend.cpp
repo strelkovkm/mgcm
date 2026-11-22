@@ -1,4 +1,5 @@
 #include "mgcm/backends/vulkan_backend.hpp"
+
 #include <vulkan/vulkan.h>
 
 #include "init_prng_vec4.hpp"
@@ -11,7 +12,7 @@
 #include "mb5_fma16.hpp"
 #include "mb5_gelu_erf.hpp"
 #include "mb5_gelu_tanh.hpp"
-#include "mb6_matmul_fused_gelu_erf.hpp" 
+#include "mb6_matmul_fused_gelu_erf.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -22,13 +23,13 @@
 #include <stdexcept>
 #include <unordered_map>
 
-#define VK_CHECK(call)                                                                     \
-    do {                                                                                   \
-        VkResult res_ = (call);                                                            \
-        if (res_ != VK_SUCCESS) {                                                          \
-            throw std::runtime_error(std::string("Vulkan error in ") + #call + ": " +      \
-                                     std::to_string(static_cast<int>(res_)));              \
-        }                                                                                  \
+#define VK_CHECK(call)                                                                                \
+    do {                                                                                              \
+        VkResult res_ = (call);                                                                       \
+        if (res_ != VK_SUCCESS) {                                                                     \
+            throw std::runtime_error(std::string("Vulkan error in ") + #call + ": " +                 \
+                                     std::to_string(static_cast<int>(res_)));                         \
+        }                                                                                             \
     } while (0)
 
 namespace mgcm {
@@ -37,12 +38,19 @@ namespace {
 std::string uuid_to_hex(const uint8_t uuid[VK_UUID_SIZE]) {
     std::ostringstream oss;
     oss << std::hex << std::setfill('0');
-    for (size_t i = 0; i < VK_UUID_SIZE; ++i) oss << std::setw(2) << static_cast<int>(uuid[i]);
+    for (size_t i = 0; i < VK_UUID_SIZE; ++i) {
+        oss << std::setw(2) << static_cast<int>(uuid[i]);
+    }
     return oss.str();
 }
 
+std::string format_vk_version(uint32_t v) {
+    return std::to_string(VK_API_VERSION_MAJOR(v)) + "." + std::to_string(VK_API_VERSION_MINOR(v)) + "." +
+           std::to_string(VK_API_VERSION_PATCH(v));
+}
+
 struct SpirvReflection {
-    uint32_t num_bindings = 0;
+    uint32_t                num_bindings = 0;
     std::array<uint32_t, 3> local_size{1, 1, 1};
 };
 
@@ -50,56 +58,73 @@ SpirvReflection parse_and_validate_canonical_abi(std::vector<uint32_t>& words, u
     if (words.size() < 5 || words[0] != 0x07230203u) {
         throw std::runtime_error("Invalid SPIR-V magic");
     }
-    bool has_shader_cap = false;
-    uint32_t entry_points = 0;
+    bool has_shader_cap      = false;
+    uint32_t entry_points    = 0;
     SpirvReflection refl{};
     std::unordered_map<uint32_t, uint32_t> id_set, id_binding, float_types;
     bool salted = (salt == 0);
 
     size_t i = 5;
     while (i < words.size()) {
-        uint16_t len = static_cast<uint16_t>(words[i] >> 16);
-        uint16_t op  = static_cast<uint16_t>(words[i] & 0xFFFFu);
-        if (len == 0 || i + len > words.size()) throw std::runtime_error("Corrupt SPIR-V stream");
-
+        auto len = static_cast<uint16_t>(words[i] >> 16);
+        auto op  = static_cast<uint16_t>(words[i] & 0xFFFFu);
+        if (len == 0 || i + len > words.size()) {
+            throw std::runtime_error("Corrupt SPIR-V stream");
+        }
         if (op == 17 && len >= 2 && words[i + 1] == 11) {
             throw std::runtime_error("ABI violation: OpCapability Int64 is forbidden for mobile GPU portability");
         }
-        if (op == 17 && len >= 2 && words[i + 1] == 1) has_shader_cap = true; // OpCapability Shader
-        else if (op == 15) { // OpEntryPoint
-            if (words[i + 1] == 5) ++entry_points; // GLCompute
-        } else if (op == 16 && len >= 6 && words[i + 2] == 17) { // OpExecutionMode LocalSize
+        if (op == 17 && len >= 2 && words[i + 1] == 1) {
+            has_shader_cap = true;
+        } else if (op == 15) {
+            if (words[i + 1] == 5) {
+                ++entry_points;
+            }
+        } else if (op == 16 && len >= 6 && words[i + 2] == 17) {
             refl.local_size = {words[i + 3], words[i + 4], words[i + 5]};
-        } else if (op == 71 && len >= 4) { // OpDecorate
+        } else if (op == 71 && len >= 4) {
             uint32_t target = words[i + 1], dec = words[i + 2];
-            if (dec == 34 && len >= 4) id_set[target] = words[i + 3];     // DescriptorSet
-            if (dec == 33 && len >= 4) id_binding[target] = words[i + 3]; // Binding
-        } else if (op == 22 && len == 3 && words[i + 2] == 32) {          // OpTypeFloat 32
+            if (dec == 34) {
+                id_set[target] = words[i + 3];
+            }
+            if (dec == 33) {
+                id_binding[target] = words[i + 3];
+            }
+        } else if (op == 22 && len == 3 && words[i + 2] == 32) {
             float_types[words[i + 1]] = 32;
         } else if (op == 43 && len == 4 && !salted && float_types.count(words[i + 1])) {
-            // OpConstant float32: mutate low mantissa bits to bypass driver SHA-1 disk shader cache
             uint32_t bits = words[i + 3];
             if ((bits & 0x7F800000u) != 0 && (bits & 0x7F800000u) != 0x7F800000u) {
                 words[i + 3] = (bits & 0xFF800000u) | ((bits ^ salt) & 0x007FFFFFu);
-                salted = true;
+                salted       = true;
             }
         }
         i += len;
     }
 
-    if (salt != 0 && !salted) throw std::runtime_error("SPIR-V salting failed: no non-zero float32 OpConstant");
-    if (!has_shader_cap) throw std::runtime_error("ABI violation: missing OpCapability Shader");
-    if (entry_points != 1) throw std::runtime_error("ABI violation: expected exactly 1 GLCompute OpEntryPoint");
+    if (salt != 0 && !salted) {
+        throw std::runtime_error("SPIR-V salting failed: no non-zero float32 OpConstant");
+    }
+    if (!has_shader_cap) {
+        throw std::runtime_error("ABI violation: missing OpCapability Shader");
+    }
+    if (entry_points != 1) {
+        throw std::runtime_error("ABI violation: expected exactly 1 GLCompute OpEntryPoint");
+    }
 
     std::vector<uint32_t> bindings;
     for (const auto& [var_id, b] : id_binding) {
         uint32_t dset = id_set.count(var_id) ? id_set[var_id] : 999u;
-        if (dset != 0) throw std::runtime_error("ABI violation: DescriptorSet must be 0");
+        if (dset != 0) {
+            throw std::runtime_error("ABI violation: DescriptorSet must be 0");
+        }
         bindings.push_back(b);
     }
     std::sort(bindings.begin(), bindings.end());
     for (uint32_t idx = 0; idx < bindings.size(); ++idx) {
-        if (bindings[idx] != idx) throw std::runtime_error("ABI violation: non-contiguous bindings");
+        if (bindings[idx] != idx) {
+            throw std::runtime_error("ABI violation: non-contiguous bindings");
+        }
     }
     refl.num_bindings = static_cast<uint32_t>(bindings.size());
     return refl;
@@ -107,9 +132,15 @@ SpirvReflection parse_and_validate_canonical_abi(std::vector<uint32_t>& words, u
 
 std::span<const uint32_t> get_builtin_spirv(BenchKernelId id, const char** out_entry) {
     switch (id) {
-        case BenchKernelId::InitPrngVec4:       *out_entry = "init_prng_vec4";  return spirv::k_init_prng_vec4;
-        case BenchKernelId::MB0_Warmup:         *out_entry = "mb0_warmup";      return spirv::k_mb0_warmup;
-        case BenchKernelId::MB1_DispatchNoop:   *out_entry = "mb1_noop";        return spirv::k_mb1_noop;
+        case BenchKernelId::InitPrngVec4:
+            *out_entry = "init_prng_vec4";
+            return spirv::k_init_prng_vec4;
+        case BenchKernelId::MB0_Warmup:
+            *out_entry = "mb0_warmup";
+            return spirv::k_mb0_warmup;
+        case BenchKernelId::MB1_DispatchNoop:
+            *out_entry = "mb1_noop";
+            return spirv::k_mb1_noop;
         case BenchKernelId::MB2_CacheStreamVec4:
             *out_entry = "mb2_stream_vec4";
             return spirv::k_mb2_stream_vec4;
@@ -141,16 +172,17 @@ std::span<const uint32_t> get_builtin_spirv(BenchKernelId id, const char** out_e
 } // namespace
 
 struct VulkanBackend::Impl {
-    VkInstance       instance     = VK_NULL_HANDLE;
-    VkPhysicalDevice phys_dev     = VK_NULL_HANDLE;
-    VkDevice         device       = VK_NULL_HANDLE;
-    VkQueue          queue        = VK_NULL_HANDLE;
-    uint32_t         queue_family = 0;
-    VkCommandPool    cmd_pool     = VK_NULL_HANDLE;
-    VkCommandBuffer  cmd_buf      = VK_NULL_HANDLE;
-    VkFence          fence        = VK_NULL_HANDLE;
-    VkQueryPool      query_pool   = VK_NULL_HANDLE;
-    VkDescriptorPool desc_pool    = VK_NULL_HANDLE;
+    VkInstance                instance                  = VK_NULL_HANDLE;
+    VkPhysicalDevice          phys_dev                  = VK_NULL_HANDLE;
+    VkDevice                  device                    = VK_NULL_HANDLE;
+    VkQueue                   queue                     = VK_NULL_HANDLE;
+    uint32_t                  queue_family              = 0;
+    VkCommandPool             cmd_pool                  = VK_NULL_HANDLE;
+    VkCommandBuffer           cmd_buf                   = VK_NULL_HANDLE;
+    VkFence                   fence                     = VK_NULL_HANDLE;
+    VkQueryPool               query_pool                = VK_NULL_HANDLE;
+    VkDescriptorPool          desc_pool                 = VK_NULL_HANDLE;
+    bool                      use_sync2                 = false;
     PFN_vkCmdPipelineBarrier2 pfn_cmd_pipeline_barrier2 = nullptr;
     PFN_vkCmdWriteTimestamp2  pfn_cmd_write_timestamp2  = nullptr;
 
@@ -170,7 +202,7 @@ struct VulkanBackend::Impl {
         SpirvReflection       refl{};
     };
 
-    uint64_t next_handle = 1;
+    uint64_t                          next_handle = 1;
     std::map<BufferHandle, BufferObj> buffers;
     std::map<KernelHandle, KernelObj> kernels;
 };
@@ -191,19 +223,28 @@ std::vector<VulkanDeviceEntry> VulkanBackend::enumerate_devices(bool include_cpu
     std::vector<VkPhysicalDevice> devs(count);
     vkEnumeratePhysicalDevices(inst, &count, devs.data());
 
+    auto pfn_gpdp2 =
+        reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(vkGetInstanceProcAddr(inst, "vkGetPhysicalDeviceProperties2"));
+
     std::vector<VulkanDeviceEntry> out;
     uint32_t logical_idx = 0;
     for (auto pd : devs) {
-        VkPhysicalDeviceVulkan12Properties p12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
-        VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &p12};
-        auto pfn_gpdp2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
-            vkGetInstanceProcAddr(inst, "vkGetPhysicalDeviceProperties2"));
-        if (!pfn_gpdp2) throw std::runtime_error("vkGetPhysicalDeviceProperties2 missing");
-        pfn_gpdp2(pd, &p2);
-
-        bool is_cpu = (p2.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU);
-        if (is_cpu && !include_cpu) continue;
-        out.push_back({logical_idx++, p2.properties.deviceName, p12.driverName, is_cpu});
+        VkPhysicalDeviceProperties base_pr{};
+        vkGetPhysicalDeviceProperties(pd, &base_pr);
+        bool is_cpu = (base_pr.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU);
+        if (is_cpu && !include_cpu) {
+            continue;
+        }
+        std::string drv = "Vulkan " + format_vk_version(base_pr.apiVersion);
+        if (pfn_gpdp2 && base_pr.apiVersion >= VK_API_VERSION_1_2) {
+            VkPhysicalDeviceVulkan12Properties p12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
+            VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &p12};
+            pfn_gpdp2(pd, &p2);
+            if (p12.driverName[0] != '\0') {
+                drv = std::string(p12.driverName) + " / VK " + format_vk_version(base_pr.apiVersion);
+            }
+        }
+        out.push_back({logical_idx++, base_pr.deviceName, drv, is_cpu});
     }
     vkDestroyInstance(inst, nullptr);
     return out;
@@ -227,7 +268,9 @@ VulkanBackend::VulkanBackend(uint32_t device_index, bool include_cpu) : impl_(st
     for (auto pd : all_devs) {
         VkPhysicalDeviceProperties pr{};
         vkGetPhysicalDeviceProperties(pd, &pr);
-        if (pr.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU && !include_cpu) continue;
+        if (pr.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU && !include_cpu) {
+            continue;
+        }
         filtered.push_back(pd);
     }
     if (device_index >= filtered.size()) {
@@ -235,14 +278,29 @@ VulkanBackend::VulkanBackend(uint32_t device_index, bool include_cpu) : impl_(st
     }
     impl_->phys_dev = filtered[device_index];
 
+    VkPhysicalDeviceProperties base_pr{};
+    vkGetPhysicalDeviceProperties(impl_->phys_dev, &base_pr);
+    uint32_t dev_api = base_pr.apiVersion;
+
     VkPhysicalDeviceVulkan13Properties p13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES};
-    VkPhysicalDeviceVulkan12Properties p12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES, &p13};
-    VkPhysicalDeviceVulkan11Properties p11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES, &p12};
+    VkPhysicalDeviceVulkan12Properties p12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
+    VkPhysicalDeviceVulkan11Properties p11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES};
+
+    if (dev_api >= VK_API_VERSION_1_3) {
+        p11.pNext = &p12;
+        p12.pNext = &p13;
+    } else if (dev_api >= VK_API_VERSION_1_2) {
+        p11.pNext = &p12;
+    }
+
     VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &p11};
     auto pfn_gpdp2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
         vkGetInstanceProcAddr(impl_->instance, "vkGetPhysicalDeviceProperties2"));
-    if (!pfn_gpdp2) throw std::runtime_error("vkGetPhysicalDeviceProperties2 missing");
-    pfn_gpdp2(impl_->phys_dev, &p2);
+    if (pfn_gpdp2 && dev_api >= VK_API_VERSION_1_1) {
+        pfn_gpdp2(impl_->phys_dev, &p2);
+    } else {
+        p2.properties = base_pr;
+    }
 
     VkPhysicalDeviceMemoryProperties mem_props{};
     vkGetPhysicalDeviceMemoryProperties(impl_->phys_dev, &mem_props);
@@ -254,25 +312,28 @@ VulkanBackend::VulkanBackend(uint32_t device_index, bool include_cpu) : impl_(st
         }
     }
 
-    auto& sp = impl_->props;
-    sp.runtime                 = RuntimeKind::Vulkan;
-    sp.device_name             = p2.properties.deviceName;
-    sp.driver_name             = p12.driverName;
-    sp.vendor_id               = p2.properties.vendorID;
-    sp.device_id               = p2.properties.deviceID;
-    sp.device_uuid_hex         = uuid_to_hex(p11.deviceUUID);
-    sp.driver_uuid_hex         = uuid_to_hex(p11.driverUUID);
-    sp.is_integrated_uma       = (p2.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) ||
-                                 (mem_props.memoryHeapCount == 1);
-    sp.subgroup_size           = p11.subgroupSize;
-    sp.min_subgroup_size       = p13.minSubgroupSize;
-    sp.max_subgroup_size       = p13.maxSubgroupSize;
-    sp.max_wg_invocations      = p2.properties.limits.maxComputeWorkGroupInvocations;
-    sp.max_shared_mem_bytes    = p2.properties.limits.maxComputeSharedMemorySize;
+    auto& sp                    = impl_->props;
+    sp.runtime                  = RuntimeKind::Vulkan;
+    sp.device_name              = p2.properties.deviceName;
+    sp.api_version_str          = format_vk_version(dev_api);
+    sp.driver_name              = (dev_api >= VK_API_VERSION_1_2 && p12.driverName[0] != '\0')
+                                      ? (std::string(p12.driverName) + " / VK " + sp.api_version_str)
+                                      : ("VK " + sp.api_version_str);
+    sp.vendor_id                = p2.properties.vendorID;
+    sp.device_id                = p2.properties.deviceID;
+    sp.device_uuid_hex          = uuid_to_hex(p11.deviceUUID);
+    sp.driver_uuid_hex          = uuid_to_hex(p11.driverUUID);
+    sp.is_integrated_uma        = (p2.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) ||
+                                  (mem_props.memoryHeapCount == 1);
+    sp.subgroup_size            = (p11.subgroupSize > 0) ? p11.subgroupSize : 16u;
+    sp.min_subgroup_size        = (dev_api >= VK_API_VERSION_1_3 && p13.minSubgroupSize > 0) ? p13.minSubgroupSize : sp.subgroup_size;
+    sp.max_subgroup_size        = (dev_api >= VK_API_VERSION_1_3 && p13.maxSubgroupSize > 0) ? p13.maxSubgroupSize : sp.subgroup_size;
+    sp.max_wg_invocations       = p2.properties.limits.maxComputeWorkGroupInvocations;
+    sp.max_shared_mem_bytes     = p2.properties.limits.maxComputeSharedMemorySize;
     sp.max_push_constants_size  = p2.properties.limits.maxPushConstantsSize;
     sp.max_storage_buffer_range = p2.properties.limits.maxStorageBufferRange;
-    sp.device_local_mem_bytes  = dev_local_bytes;
-    sp.timestamp_period_ns     = static_cast<double>(p2.properties.limits.timestampPeriod);
+    sp.device_local_mem_bytes   = dev_local_bytes;
+    sp.timestamp_period_ns      = static_cast<double>(p2.properties.limits.timestampPeriod);
 
     uint32_t qcount = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(impl_->phys_dev, &qcount, nullptr);
@@ -283,11 +344,28 @@ VulkanBackend::VulkanBackend(uint32_t device_index, bool include_cpu) : impl_(st
     for (uint32_t q = 0; q < qcount; ++q) {
         if ((qprops[q].queueFlags & VK_QUEUE_COMPUTE_BIT) && qprops[q].timestampValidBits > 0) {
             impl_->queue_family = q;
-            found_q = true;
-            if (!(qprops[q].queueFlags & VK_QUEUE_GRAPHICS_BIT)) break;
+            found_q             = true;
+            if (!(qprops[q].queueFlags & VK_QUEUE_GRAPHICS_BIT)) {
+                break;
+            }
         }
     }
-    if (!found_q) throw std::runtime_error("No compute queue with timestamp support found");
+    if (!found_q) {
+        throw std::runtime_error("No compute queue with timestamp support found");
+    }
+
+    uint32_t ext_count = 0;
+    vkEnumerateDeviceExtensionProperties(impl_->phys_dev, nullptr, &ext_count, nullptr);
+    std::vector<VkExtensionProperties> exts(ext_count);
+    vkEnumerateDeviceExtensionProperties(impl_->phys_dev, nullptr, &ext_count, exts.data());
+    auto has_ext = [&](const char* name) {
+        for (const auto& e : exts) {
+            if (std::strcmp(e.extensionName, name) == 0) {
+                return true;
+            }
+        }
+        return false;
+    };
 
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
@@ -300,29 +378,42 @@ VulkanBackend::VulkanBackend(uint32_t device_index, bool include_cpu) : impl_(st
     f13.maintenance4     = VK_TRUE;
 
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f13};
-    f12.timelineSemaphore        = VK_TRUE;
-    f12.storageBuffer8BitAccess  = VK_TRUE;
+    f12.timelineSemaphore       = VK_TRUE;
+    f12.storageBuffer8BitAccess = VK_TRUE;
 
-    VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f12};
+    VkPhysicalDeviceSynchronization2FeaturesKHR sync2_khr{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR};
+    sync2_khr.synchronization2 = VK_TRUE;
+
+    std::vector<const char*> enabled_exts;
+    VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos    = &qci;
+
+    if (dev_api >= VK_API_VERSION_1_3) {
+        dci.pNext = &f12;
+    } else if (has_ext(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME)) {
+        enabled_exts.push_back(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
+        dci.pNext = &sync2_khr;
+    }
+    dci.enabledExtensionCount   = static_cast<uint32_t>(enabled_exts.size());
+    dci.ppEnabledExtensionNames = enabled_exts.empty() ? nullptr : enabled_exts.data();
+
     VK_CHECK(vkCreateDevice(impl_->phys_dev, &dci, nullptr, &impl_->device));
     vkGetDeviceQueue(impl_->device, impl_->queue_family, 0, &impl_->queue);
-    impl_->pfn_cmd_pipeline_barrier2 = reinterpret_cast<PFN_vkCmdPipelineBarrier2>(
-        vkGetDeviceProcAddr(impl_->device, "vkCmdPipelineBarrier2"));
-    if (!impl_->pfn_cmd_pipeline_barrier2) {
-        impl_->pfn_cmd_pipeline_barrier2 = reinterpret_cast<PFN_vkCmdPipelineBarrier2>(
-            vkGetDeviceProcAddr(impl_->device, "vkCmdPipelineBarrier2KHR"));
+
+    if (dev_api >= VK_API_VERSION_1_3) {
+        impl_->pfn_cmd_pipeline_barrier2 =
+            reinterpret_cast<PFN_vkCmdPipelineBarrier2>(vkGetDeviceProcAddr(impl_->device, "vkCmdPipelineBarrier2"));
+        impl_->pfn_cmd_write_timestamp2 =
+            reinterpret_cast<PFN_vkCmdWriteTimestamp2>(vkGetDeviceProcAddr(impl_->device, "vkCmdWriteTimestamp2"));
+    } else if (!enabled_exts.empty()) {
+        impl_->pfn_cmd_pipeline_barrier2 =
+            reinterpret_cast<PFN_vkCmdPipelineBarrier2>(vkGetDeviceProcAddr(impl_->device, "vkCmdPipelineBarrier2KHR"));
+        impl_->pfn_cmd_write_timestamp2 =
+            reinterpret_cast<PFN_vkCmdWriteTimestamp2>(vkGetDeviceProcAddr(impl_->device, "vkCmdWriteTimestamp2KHR"));
     }
-    impl_->pfn_cmd_write_timestamp2 = reinterpret_cast<PFN_vkCmdWriteTimestamp2>(
-        vkGetDeviceProcAddr(impl_->device, "vkCmdWriteTimestamp2"));
-    if (!impl_->pfn_cmd_write_timestamp2) {
-        impl_->pfn_cmd_write_timestamp2 = reinterpret_cast<PFN_vkCmdWriteTimestamp2>(
-            vkGetDeviceProcAddr(impl_->device, "vkCmdWriteTimestamp2KHR"));
-    }
-    if (!impl_->pfn_cmd_pipeline_barrier2 || !impl_->pfn_cmd_write_timestamp2) {
-        throw std::runtime_error("Device lacks Vulkan 1.3 Synchronization2 entry points");
-    }
+    impl_->use_sync2 = (impl_->pfn_cmd_pipeline_barrier2 != nullptr && impl_->pfn_cmd_write_timestamp2 != nullptr);
 
     VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     cpci.flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -353,7 +444,9 @@ VulkanBackend::VulkanBackend(uint32_t device_index, bool include_cpu) : impl_(st
 }
 
 VulkanBackend::~VulkanBackend() {
-    if (!impl_ || !impl_->device) return;
+    if (!impl_ || !impl_->device) {
+        return;
+    }
     vkDeviceWaitIdle(impl_->device);
     for (auto& [_, k] : impl_->kernels) {
         vkDestroyPipeline(impl_->device, k.pipeline, nullptr);
@@ -392,18 +485,25 @@ BufferHandle VulkanBackend::allocate_buffer(size_t size_bytes) {
     vkGetPhysicalDeviceMemoryProperties(impl_->phys_dev, &mp);
 
     uint32_t chosen_type = UINT32_MAX;
-    // On discrete GPUs, prefer pure VRAM (DEVICE_LOCAL without HOST_VISIBLE), then fallback to any DEVICE_LOCAL
     for (int pass = 0; pass < 2 && chosen_type == UINT32_MAX; ++pass) {
         for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
-            if (!(req.memoryTypeBits & (1u << i))) continue;
+            if (!(req.memoryTypeBits & (1u << i))) {
+                continue;
+            }
             auto flags = mp.memoryTypes[i].propertyFlags;
-            if (!(flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) continue;
-            if (pass == 0 && !impl_->props.is_integrated_uma && (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) continue;
+            if (!(flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+                continue;
+            }
+            if (pass == 0 && !impl_->props.is_integrated_uma && (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+                continue;
+            }
             chosen_type = i;
             break;
         }
     }
-    if (chosen_type == UINT32_MAX) throw std::runtime_error("Failed to find DEVICE_LOCAL memory type");
+    if (chosen_type == UINT32_MAX) {
+        throw std::runtime_error("Failed to find DEVICE_LOCAL memory type");
+    }
 
     VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     mai.allocationSize  = req.size;
@@ -411,14 +511,16 @@ BufferHandle VulkanBackend::allocate_buffer(size_t size_bytes) {
     VK_CHECK(vkAllocateMemory(impl_->device, &mai, nullptr, &bo.memory));
     VK_CHECK(vkBindBufferMemory(impl_->device, bo.buffer, bo.memory, 0));
 
-    BufferHandle h = impl_->next_handle++;
+    BufferHandle h    = impl_->next_handle++;
     impl_->buffers[h] = bo;
     return h;
 }
 
 void VulkanBackend::free_buffer(BufferHandle buf) {
     auto it = impl_->buffers.find(buf);
-    if (it == impl_->buffers.end()) return;
+    if (it == impl_->buffers.end()) {
+        return;
+    }
     vkDeviceWaitIdle(impl_->device);
     vkDestroyBuffer(impl_->device, it->second.buffer, nullptr);
     vkFreeMemory(impl_->device, it->second.memory, nullptr);
@@ -427,7 +529,7 @@ void VulkanBackend::free_buffer(BufferHandle buf) {
 
 KernelHandle VulkanBackend::compile_kernel(BenchKernelId id, uint32_t salt, double* out_cpu_compile_ns) {
     const char* entry_name = nullptr;
-    auto base_spv = get_builtin_spirv(id, &entry_name);
+    auto base_spv          = get_builtin_spirv(id, &entry_name);
     std::vector<uint32_t> words(base_spv.begin(), base_spv.end());
 
     Impl::KernelObj ko{};
@@ -463,7 +565,6 @@ KernelHandle VulkanBackend::compile_kernel(BenchKernelId id, uint32_t salt, doub
     cpci.stage.module = ko.shader;
     cpci.stage.pName  = entry_name;
     cpci.layout       = ko.pipe_layout;
-    // Pass VK_NULL_HANDLE for pipelineCache to measure uncached driver pipeline creation
     VK_CHECK(vkCreateComputePipelines(impl_->device, VK_NULL_HANDLE, 1, &cpci, nullptr, &ko.pipeline));
     auto t1 = std::chrono::steady_clock::now();
 
@@ -477,14 +578,16 @@ KernelHandle VulkanBackend::compile_kernel(BenchKernelId id, uint32_t salt, doub
     dsai.pSetLayouts        = &ko.set_layout;
     VK_CHECK(vkAllocateDescriptorSets(impl_->device, &dsai, &ko.desc_set));
 
-    KernelHandle h = impl_->next_handle++;
+    KernelHandle h    = impl_->next_handle++;
     impl_->kernels[h] = ko;
     return h;
 }
 
 void VulkanBackend::destroy_kernel(KernelHandle kernel) {
     auto it = impl_->kernels.find(kernel);
-    if (it == impl_->kernels.end()) return;
+    if (it == impl_->kernels.end()) {
+        return;
+    }
     vkDeviceWaitIdle(impl_->device);
     vkFreeDescriptorSets(impl_->device, impl_->desc_pool, 1, &it->second.desc_set);
     vkDestroyPipeline(impl_->device, it->second.pipeline, nullptr);
@@ -504,12 +607,20 @@ TimingResult VulkanBackend::execute(const DispatchDesc& desc) {
     }
 
     std::vector<VkDescriptorBufferInfo> dbi(desc.buffers.size());
-    std::vector<VkWriteDescriptorSet>   writes(desc.buffers.size());
+    std::vector<VkWriteDescriptorSet> writes(desc.buffers.size());
     for (size_t i = 0; i < desc.buffers.size(); ++i) {
         const auto& bo = impl_->buffers.at(desc.buffers[i]);
-        dbi[i] = {bo.buffer, 0, bo.size};
-        writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ko.desc_set,
-                     static_cast<uint32_t>(i), 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &dbi[i], nullptr};
+        dbi[i]         = {bo.buffer, 0, bo.size};
+        writes[i]      = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                          nullptr,
+                          ko.desc_set,
+                          static_cast<uint32_t>(i),
+                          0,
+                          1,
+                          VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                          nullptr,
+                          &dbi[i],
+                          nullptr};
     }
     if (!writes.empty()) {
         vkUpdateDescriptorSets(impl_->device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
@@ -525,25 +636,52 @@ TimingResult VulkanBackend::execute(const DispatchDesc& desc) {
 
     vkCmdResetQueryPool(impl_->cmd_buf, impl_->query_pool, 0, 2);
     vkCmdBindPipeline(impl_->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ko.pipeline);
-    vkCmdBindDescriptorSets(impl_->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ko.pipe_layout, 0, 1, &ko.desc_set, 0, nullptr);
+    vkCmdBindDescriptorSets(
+        impl_->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ko.pipe_layout, 0, 1, &ko.desc_set, 0, nullptr);
     vkCmdPushConstants(impl_->cmd_buf, ko.pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 128, push_buf.data());
 
-    impl_->pfn_cmd_write_timestamp2(impl_->cmd_buf, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, impl_->query_pool, 0);
+    if (impl_->use_sync2) {
+        impl_->pfn_cmd_write_timestamp2(impl_->cmd_buf, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, impl_->query_pool, 0);
+    } else {
+        vkCmdWriteTimestamp(impl_->cmd_buf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, impl_->query_pool, 0);
+    }
+
     for (uint32_t r = 0; r < desc.repeat_in_cmdbuf; ++r) {
         if (r > 0 && desc.barrier_between_repeats) {
-            VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
-            mb.srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-            mb.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-            mb.dstStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-            mb.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-            VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-            dep.memoryBarrierCount = 1;
-            dep.pMemoryBarriers    = &mb;
-            impl_->pfn_cmd_pipeline_barrier2(impl_->cmd_buf, &dep);
+            if (impl_->use_sync2) {
+                VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+                mb.srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                mb.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                mb.dstStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                mb.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+                dep.memoryBarrierCount = 1;
+                dep.pMemoryBarriers    = &mb;
+                impl_->pfn_cmd_pipeline_barrier2(impl_->cmd_buf, &dep);
+            } else {
+                VkMemoryBarrier mb1{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                mb1.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                mb1.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                vkCmdPipelineBarrier(impl_->cmd_buf,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                     0,
+                                     1,
+                                     &mb1,
+                                     0,
+                                     nullptr,
+                                     0,
+                                     nullptr);
+            }
         }
         vkCmdDispatch(impl_->cmd_buf, desc.group_count[0], desc.group_count[1], desc.group_count[2]);
     }
-    impl_->pfn_cmd_write_timestamp2(impl_->cmd_buf, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, impl_->query_pool, 1);
+
+    if (impl_->use_sync2) {
+        impl_->pfn_cmd_write_timestamp2(impl_->cmd_buf, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, impl_->query_pool, 1);
+    } else {
+        vkCmdWriteTimestamp(impl_->cmd_buf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, impl_->query_pool, 1);
+    }
     VK_CHECK(vkEndCommandBuffer(impl_->cmd_buf));
 
     VK_CHECK(vkResetFences(impl_->device, 1, &impl_->fence));
@@ -557,7 +695,13 @@ TimingResult VulkanBackend::execute(const DispatchDesc& desc) {
     auto cpu_t1 = std::chrono::steady_clock::now();
 
     uint64_t ts[2] = {0, 0};
-    VK_CHECK(vkGetQueryPoolResults(impl_->device, impl_->query_pool, 0, 2, sizeof(ts), ts, sizeof(uint64_t),
+    VK_CHECK(vkGetQueryPoolResults(impl_->device,
+                                   impl_->query_pool,
+                                   0,
+                                   2,
+                                   sizeof(ts),
+                                   ts,
+                                   sizeof(uint64_t),
                                    VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
 
     TimingResult tr{};

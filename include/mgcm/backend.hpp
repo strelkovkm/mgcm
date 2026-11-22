@@ -47,6 +47,7 @@ struct StaticDeviceProps {
     RuntimeKind runtime                 = RuntimeKind::Vulkan;
     std::string device_name;
     std::string driver_name;
+    std::string api_version_str;
     uint32_t    vendor_id               = 0;
     uint32_t    device_id               = 0;
     std::string device_uuid_hex;

@@ -13,7 +13,7 @@ function(mgcm_add_slang_shader OUT_HEADERS_VAR SLANG_REL_PATH ENTRY_NAME VAR_NAM
             OUTPUT "${HDR_FILE}"
             COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/spv"
             COMMAND "${SLANGC_EXECUTABLE}" "${SRC_FILE}"
-                    -target spirv -profile spirv_1_6
+                    -target spirv -profile spirv_1_3
                     -emit-spirv-directly -fvk-use-entrypoint-name
                     -entry "${ENTRY_NAME}" -o "${SPV_FILE}"
             ${VAL_CMD}
