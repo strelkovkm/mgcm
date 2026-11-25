@@ -224,16 +224,14 @@ void Calibrator::run_mb2_cache_hierarchy(DeviceProfile& out, BufferHandle shared
         auto st = calc_median_iqr(gbps_samples);
         out.bw_curve.push_back({w_bytes, st.median, st.iqr});
         if (w_bytes >= 16ull * 1024 * 1024 && out.bw_curve.size() >= 10) {
-            double peak_bw = 0.0;
-            for (const auto& pt : out.bw_curve) peak_bw = std::max(peak_bw, pt.bw_median_gbps);
             const auto& c = out.bw_curve;
             double b0 = c[c.size()-1].bw_median_gbps, b1 = c[c.size()-2].bw_median_gbps;
             double b2 = c[c.size()-3].bw_median_gbps, b3 = c[c.size()-4].bw_median_gbps;
             double mean4 = 0.25 * (b0 + b1 + b2 + b3);
             double span4 = std::max({b0, b1, b2, b3}) - std::min({b0, b1, b2, b3});
             double pass_ms = (static_cast<double>(w_bytes) / std::max(0.1, st.median)) * 1e-6;
-            bool cliff_passed = (mean4 < 0.45 * peak_bw) || (pass_ms >= 2.0 && mean4 < 0.82 * peak_bw);
-            if (cliff_passed && (span4 / std::max(0.1, mean4)) < 0.06) break;
+            // Only early-stop slow memory buses (pass_ms >= 2 ms) once 4 consecutive points form a flat plateau
+            if (pass_ms >= 2.0 && (span4 / std::max(0.1, mean4)) < 0.08) break;
         }
     }
 

@@ -12,10 +12,11 @@ struct StreamParams {
 [numthreads(256, 1, 1)]
 void mb2_stream_vec4(uint3 gid : SV_GroupID, uint3 ltid : SV_GroupThreadID, uint3 dtid : SV_DispatchThreadID) {
     float4 acc = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    uint base_blk = gid.x % pc.num_blocks;
+    uint rot_step = 17u % pc.num_blocks;
 
     [loop]
     for (uint r = 0; r < pc.sweeps; ++r) {
-        uint base_blk = (gid.x + r * 17u) % pc.num_blocks;
         [loop]
         for (uint p = 0; p < pc.passes_per_sweep; ++p) {
             uint blk = base_blk + p * 128u;
@@ -23,6 +24,10 @@ void mb2_stream_vec4(uint3 gid : SV_GroupID, uint3 ltid : SV_GroupThreadID, uint
                 blk -= pc.num_blocks;
             }
             acc += src_buf[blk * 256u + ltid.x];
+        }
+        base_blk += rot_step;
+        if (base_blk >= pc.num_blocks) {
+            base_blk -= pc.num_blocks;
         }
     }
 
