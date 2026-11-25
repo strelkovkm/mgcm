@@ -49,6 +49,8 @@ struct DeviceProfile {
     double                          alpha_1_gc_ms_per_word    = 0.0;
     double                          beta_0_drv_ms             = 0.0;
     double                          beta_1_drv_ms_per_word    = 0.0;
+    double                          beta_0_drv_smem_ms        = 0.0;
+    double                          beta_1_drv_smem_ms_per_word = 0.0;
     double                          t_cache_hit_ms            = 0.0;
     double                          r2_fe_slang               = 0.0;
     double                          r2_fe_gc                  = 0.0;

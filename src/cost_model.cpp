@@ -84,7 +84,11 @@ double UniversalCostEngine::kernel_compile_ms(const KernelWorkload& kw) const {
     }
 
     if (kw.drv_cache_miss) {
-        total_ms += prof_.beta_0_drv_ms + prof_.beta_1_drv_ms_per_word * words;
+        if (kw.uses_shared_mem && prof_.beta_1_drv_smem_ms_per_word > 0.0) {
+            total_ms += prof_.beta_0_drv_smem_ms + prof_.beta_1_drv_smem_ms_per_word * words;
+        } else {
+            total_ms += prof_.beta_0_drv_ms + prof_.beta_1_drv_ms_per_word * words;
+        }
     } else {
         total_ms += prof_.t_cache_hit_ms;
     }

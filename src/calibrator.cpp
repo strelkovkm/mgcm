@@ -624,7 +624,19 @@ void Calibrator::run_mb6_compile_ols(DeviceProfile& out, BufferHandle shared_src
     auto drv_fit                 = fit_ols_1d(drv_xs, drv_ys, true);
     out.beta_0_drv_ms            = drv_fit.intercept;
     out.beta_1_drv_ms_per_word   = drv_fit.slope;
+    out.beta_0_drv_smem_ms       = drv_fit.intercept;
+    out.beta_1_drv_smem_ms_per_word = drv_fit.slope;
     out.r2_drv                   = drv_fit.r2;
+    if (drv_fit.r2 < 0.95 && drv_xs.size() >= 6) {
+        std::vector<double> lx(drv_xs.begin(), drv_xs.begin() + 4), ly(drv_ys.begin(), drv_ys.begin() + 4);
+        std::vector<double> sx(drv_xs.begin() + 4, drv_xs.end()),   sy(drv_ys.begin() + 4, drv_ys.end());
+        auto lin_fit  = fit_ols_1d(lx, ly, true);
+        auto smem_fit = fit_ols_1d(sx, sy, true);
+        out.beta_0_drv_ms               = lin_fit.intercept;
+        out.beta_1_drv_ms_per_word      = lin_fit.slope;
+        out.beta_0_drv_smem_ms          = smem_fit.intercept;
+        out.beta_1_drv_smem_ms_per_word = smem_fit.slope;
+    }
     out.t_cache_hit_ms           = backend_.measure_pipeline_cache_hit_ms(BenchKernelId::MB4_MatmulSmem);
     out.stage_timings.mb6_drv_ms = drv_wall_ms;
     out.stage_timings.mb6_fe_ms  = fe_wall_ms;
@@ -784,6 +796,8 @@ std::string Calibrator::to_json_string(const DeviceProfile& p) {
                            {"alpha_1_gc_ms_per_word", p.alpha_1_gc_ms_per_word},
                            {"beta_0_drv_ms", p.beta_0_drv_ms},
                            {"beta_1_drv_ms_per_word", p.beta_1_drv_ms_per_word},
+                           {"beta_0_drv_smem_ms", p.beta_0_drv_smem_ms},
+                           {"beta_1_drv_smem_ms_per_word", p.beta_1_drv_smem_ms_per_word},
                            {"t_cache_hit_ms", p.t_cache_hit_ms},
                            {"r2_fe_slang", p.r2_fe_slang},
                            {"r2_fe_gc", p.r2_fe_gc},
@@ -864,6 +878,8 @@ DeviceProfile Calibrator::from_json_string(const std::string& json_text) {
     p.alpha_1_gc_ms_per_word    = j6.value("alpha_1_gc_ms_per_word", 0.0);
     p.beta_0_drv_ms             = j6.value("beta_0_drv_ms", 0.0);
     p.beta_1_drv_ms_per_word    = j6.value("beta_1_drv_ms_per_word", 0.0);
+    p.beta_0_drv_smem_ms        = j6.value("beta_0_drv_smem_ms", p.beta_0_drv_ms);
+    p.beta_1_drv_smem_ms_per_word = j6.value("beta_1_drv_smem_ms_per_word", p.beta_1_drv_ms_per_word);
     p.t_cache_hit_ms            = j6.value("t_cache_hit_ms", 0.0);
     p.r2_fe_slang               = j6.value("r2_fe_slang", 0.0);
     p.r2_fe_gc                  = j6.value("r2_fe_gc", 0.0);
