@@ -21,7 +21,7 @@ Each kernel $k \in P$ undergoes host frontend lowering $c_k \in \{\text{GC}, \te
 
 $$T_{\text{compile}}^{\text{total}}(P, \theta) = \sum_{k \in P} \Bigg[ \mathbb{I}_{\text{fe\_miss}}(k)\Big(\alpha_0^{(c_k)} + \alpha_1^{(c_k)} \widehat{L}_{\text{spv}}^{(c_k)}(k, \theta)\Big) + \mathbb{I}_{\text{drv\_miss}}(k)\Big(\beta_0^{\text{drv}} + \beta_1^{\text{drv}} \widehat{L}_{\text{spv}}^{(c_k)}(k, \theta)\Big) + \big(1 - \mathbb{I}_{\text{drv\_miss}}(k)\big) t_{\text{cache\_hit}} \Bigg]$$
 
-* **Theoretical Justification & Applicability Domain:** Single-pass SSA construction and Linear Scan register allocation in JIT backends exhibit $O(L_{\text{IR}})$ linear scaling in instruction length (*Poletto & Sarkar, ACM TOPLAS 1999*; *Braun et al., CC 2013*), while amortized operator-fusion trade-offs follow $T_C + R \cdot T_X$ (*Niu et al., DNNFusion, ACM PLDI 2021*; *Kamei & Costa, CBSoft 2026*). Linearity over $L_{\text{spv}} \le 12\,000$ words is empirically verified per device via $R^2$ stored in `DeviceProfile` (validity threshold: $R^2 \ge 0.95$).
+* **Theoretical Justification & Applicability Domain:** Single-pass SSA construction and Linear Scan register allocation in JIT backends exhibit $O(L_{\text{IR}})$ linear scaling in instruction length (*Poletto & Sarkar, ACM TOPLAS 1999*; *Braun et al., CC 2013*), while amortized operator-fusion trade-offs follow $T_C + R \cdot T_X$ (*Niu et al., DNNFusion, ACM PLDI 2021*; *Kamei & Costa, CBSoft 2026*). Linearity over $L_{\text{spv}} \le 12\,000$ words is empirically verified per device via $R^2$ stored in `DeviceProfile` (validity thresholds: $R^2_{\mathrm{drv}} \ge 0.95$ for SSA driver backend, $R^2_{\mathrm{fe}} \ge 0.90$ for AST/IR frontend).
 
 ### 2.2. Analytical Pre-Compilation SPIR-V Length Estimator $\widehat{L}_{\text{spv}}^{(c)}(k, \theta)$
 Because boundary selection runs prior to invoking `GC` or `Slang`, the 32-bit SPIR-V word length is predicted deterministically via syntax-directed translation rules (*Khronos SPIR-V Spec v1.6, §3*; *Aho et al., Compilers, 2nd ed., Ch. 5*):
@@ -81,7 +81,7 @@ Substituting block dimensions yields straight lines $C_i(R_{\text{eff}}) = b_i +
 | **3–4** | `alpha_0_gc_ms`, `alpha_1_gc_ms_per_word` | `ms`, `ms/w` | `MB6`: OLS fit for host `GraphCompiler` MLIR passes + `LLJIT` |
 | **5–6** | `beta_0_drv_ms`, `beta_1_drv_ms_per_word` | `ms`, `ms/w` | `MB6`: OLS fit ($M=6$ lengths, median of $N=7$ SPIR-V constant mutations, `create + lazy`) |
 | **7** | `t_cache_hit_ms` | `ms` | `MB6`: warm `vkCreateComputePipelines` lookup latency on populated `VkPipelineCache` |
-| **8–9** | `r2_fe`, `r2_drv` *(+ `calibration_wall_time_ms`)* | `[0..1]`, `ms` | `MB6`: linearity validation ($R^2 \ge 0.95$) and end-to-end calibration budget |
+| **8–9** | `r2_fe`, `r2_drv` *(+ `calibration_wall_time_ms`)* | `[0..1]`, `ms` | `MB6`: linearity validation ($R^2_{\mathrm{drv}} \ge 0.95, R^2_{\mathrm{fe}} \ge 0.90$) and end-to-end calibration budget |
 | **10** | `t_submit_cpu_us` | `us` | `MB1`: `cpu_wall(1) - gpu_exec(1)` |
 | **11–12** | `t_launch_gpu_us`, `t_barrier_gpu_us` | `us` | `MB1`: OLS slope over $N \in \{1, 8, 32, 128\}$ chains without and with RAW barriers |
 | **13** | `bw_curve` *(22 points)* | `(B, GB/s)` | `MB2`: bijective permutation scan `32 KB .. 256 MB` (`P50` median and `IQR`) |
