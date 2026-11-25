@@ -85,6 +85,7 @@ int main(int argc, char** argv) {
 
         std::map<mgcm::BenchKernelId, double> real_cold_drv_us, real_cold_fe_us, real_hit_drv_us;
         for (auto kid : all_kids) {
+            std::cout << "[Oracle Compile Probe] kid=" << static_cast<int>(kid) << "..." << std::endl;
             std::vector<double> drv_s, fe_s;
             for (int s = 0; s < 5; ++s) {
                 uint32_t salt = ((rng() & 0x007FFFFEu) | 1u);
@@ -124,6 +125,7 @@ int main(int argc, char** argv) {
         // Compile persistent execution handles for steady-state timing across M
         std::map<mgcm::BenchKernelId, mgcm::KernelHandle> khs;
         for (auto kid : all_kids) {
+            std::cout << "[Oracle Compile Probe] kid=" << static_cast<int>(kid) << "..." << std::endl;
             khs[kid] = vk.compile_kernel(kid, 0);
         }
 
@@ -232,7 +234,7 @@ int main(int argc, char** argv) {
                     << real_exec_p[p] << "," << pred_nomem[p].t_execute_us << "," << pred_nodisp[p].t_execute_us << "," << iqr_of(us) << "\n";
             }
 
-            std::cout << "[M=" << std::setw(4) << M << "] " << std::fixed << std::setprecision(1)
+            std::cout << std::flush << "[M=" << std::setw(4) << M << "] " << std::fixed << std::setprecision(1)
                       << "P0(pred=" << pred_full[0].t_execute_us << " / real=" << real_exec_p[0] << " us) | "
                       << "P2(pred=" << pred_full[2].t_execute_us << " / real=" << real_exec_p[2] << " us) | "
                       << "P3(pred=" << pred_full[3].t_execute_us << " / real=" << real_exec_p[3] << " us)\n";

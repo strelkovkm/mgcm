@@ -122,6 +122,10 @@ void Calibrator::run_mb1_dispatch(DeviceProfile& out) {
             auto tr = backend_.execute(d);
             cpu_us.push_back(tr.cpu_wall_ns * 1e-3);
             gpu_us.push_back(tr.gpu_execution_ns * 1e-3);
+            if (it >= 6) {
+                auto st = calc_median_iqr(gpu_us);
+                if (st.iqr <= 0.015 * std::max(0.01, st.median)) break;
+            }
         }
         return std::pair{calc_median_iqr(cpu_us).median, calc_median_iqr(gpu_us).median};
     };
@@ -188,8 +192,8 @@ void Calibrator::run_mb2_cache_hierarchy(DeviceProfile& out, BufferHandle shared
                 Scalar32::U32(num_blocks), Scalar32::U32(passes), Scalar32::U32(sweeps), Scalar32::F32(-999999.0f)};
             backend_.execute({stream_krn, bufs, psc, {kNumGroups, 1, 1}, {kLocalSize, 1, 1}, 1, false});
             auto pr = backend_.execute({stream_krn, bufs, psc, {kNumGroups, 1, 1}, {kLocalSize, 1, 1}, 1, false});
-            if (pr.gpu_execution_ns < 450000.0 && pr.gpu_execution_ns > 10.0) {
-                auto mul = static_cast<uint32_t>(std::ceil(450000.0 / pr.gpu_execution_ns));
+            if (pr.gpu_execution_ns < 220000.0 && pr.gpu_execution_ns > 10.0) {
+                auto mul = static_cast<uint32_t>(std::ceil(220000.0 / pr.gpu_execution_ns));
                 sweeps *= std::clamp<uint32_t>(mul, 1u, 64u);
             }
         }
@@ -209,10 +213,26 @@ void Calibrator::run_mb2_cache_hierarchy(DeviceProfile& out, BufferHandle shared
             (w_bytes >= 64 * 1024 * 1024) ? std::max<uint32_t>(11u, cfg_.timed_iters / 2) : cfg_.timed_iters;
         for (uint32_t it = 0; it < iters; ++it) {
             gbps_samples.push_back(bytes_per_dispatch / backend_.execute(d).gpu_execution_ns);
+            if (it >= 5) {
+                auto s = calc_median_iqr(gbps_samples);
+                if (s.iqr <= 0.015 * s.median) break;
+            }
         }
 
         auto st = calc_median_iqr(gbps_samples);
         out.bw_curve.push_back({w_bytes, st.median, st.iqr});
+        if (w_bytes >= 16ull * 1024 * 1024 && out.bw_curve.size() >= 10) {
+            double peak_bw = 0.0;
+            for (const auto& pt : out.bw_curve) peak_bw = std::max(peak_bw, pt.bw_median_gbps);
+            const auto& c = out.bw_curve;
+            double b0 = c[c.size()-1].bw_median_gbps, b1 = c[c.size()-2].bw_median_gbps;
+            double b2 = c[c.size()-3].bw_median_gbps, b3 = c[c.size()-4].bw_median_gbps;
+            double mean4 = 0.25 * (b0 + b1 + b2 + b3);
+            double span4 = std::max({b0, b1, b2, b3}) - std::min({b0, b1, b2, b3});
+            double pass_ms = (static_cast<double>(w_bytes) / std::max(0.1, st.median)) * 1e-6;
+            bool cliff_passed = (mean4 < 0.45 * peak_bw) || (pass_ms >= 2.0 && mean4 < 0.82 * peak_bw);
+            if (cliff_passed && (span4 / std::max(0.1, mean4)) < 0.06) break;
+        }
     }
 
     const auto& c = out.bw_curve;
@@ -277,6 +297,7 @@ void Calibrator::run_mb3_stride(DeviceProfile& out, BufferHandle shared_src_buf,
         std::vector<double> samples;
         for (uint32_t it = 0; it < 15; ++it) {
             samples.push_back(useful_bytes / backend_.execute(d).gpu_execution_ns);
+            if (it >= 5 && calc_median_iqr(samples).iqr <= 0.015 * calc_median_iqr(samples).median) break;
         }
         return calc_median_iqr(samples).median;
     };
@@ -285,7 +306,8 @@ void Calibrator::run_mb3_stride(DeviceProfile& out, BufferHandle shared_src_buf,
     if (out.l2_effective_bytes > 0 && out.l2_effective_bytes <= 1024ull * 1024ull) {
         w_l2 = 512ull * 1024ull;
     }
-    size_t w_dram = std::min<size_t>(max_bytes, std::max<size_t>(128ull * 1024ull * 1024ull, out.l2_effective_bytes * 4));
+    size_t max_w = out.bw_curve.empty() ? max_bytes : out.bw_curve.back().working_set_bytes;
+    size_t w_dram = std::min<size_t>(max_w, std::max<size_t>(16ull * 1024ull * 1024ull, out.l2_effective_bytes * 8));
 
     double l2_s1    = measure_stride_bw(w_l2, 1);
     double l2_s32   = measure_stride_bw(w_l2, 32);
@@ -307,7 +329,9 @@ void Calibrator::run_mb3_stride(DeviceProfile& out, BufferHandle shared_src_buf,
 }
 
 void Calibrator::run_mb4_tiled_gemm(DeviceProfile& out, BufferHandle shared_src_buf) {
-    constexpr uint32_t M = 1024, N = 1024, K = 512;
+    const bool is_emb = (out.pi_fma_gflops > 0.0 && out.pi_fma_gflops < 100.0);
+    const uint32_t M = is_emb ? 256u : 1024u, N = M, K = is_emb ? 128u : 512u;
+    const uint32_t Mt = M - 24u, Nt = N - 24u, Kt = K - 12u;
     BufferHandle buf_b    = backend_.allocate_buffer(K * N * sizeof(float));
     BufferHandle buf_bias = backend_.allocate_buffer(N * sizeof(float));
     BufferHandle buf_c    = backend_.allocate_buffer(M * N * sizeof(float));
@@ -344,6 +368,7 @@ void Calibrator::run_mb4_tiled_gemm(DeviceProfile& out, BufferHandle shared_src_
         std::vector<double> gflops;
         for (uint32_t it = 0; it < cfg_.timed_iters; ++it) {
             gflops.push_back(flops / backend_.execute(d).gpu_execution_ns);
+            if (it >= 5 && calc_median_iqr(gflops).iqr <= 0.015 * calc_median_iqr(gflops).median) break;
         }
         backend_.destroy_kernel(krn);
         return calc_median_iqr(gflops).median;
@@ -351,7 +376,7 @@ void Calibrator::run_mb4_tiled_gemm(DeviceProfile& out, BufferHandle shared_src_
 
     out.gflops_matmul_smem    = bench_gemm(BenchKernelId::MB4_MatmulSmem, M, N, K);
     out.gflops_matmul_cache   = bench_gemm(BenchKernelId::MB4_MatmulDirectCache, M, N, K);
-    double gflops_tail        = bench_gemm(BenchKernelId::MB4_MatmulSmemTail, 1000, 1000, 500);
+    double gflops_tail        = bench_gemm(BenchKernelId::MB4_MatmulSmemTail, Mt, Nt, Kt);
     double gflops_fused_erf   = bench_gemm(BenchKernelId::MB6_MatmulFusedGeluErf, M, N, K);
 
     out.smem_vs_cache_speedup = out.gflops_matmul_smem / std::max(1e-6, out.gflops_matmul_cache);
@@ -386,24 +411,30 @@ void Calibrator::run_mb5_compute_and_waves(DeviceProfile& out) {
     KernelHandle krn_tanh = backend_.compile_kernel(BenchKernelId::MB5_GeluTanh, 0);
     KernelHandle krn_erf  = backend_.compile_kernel(BenchKernelId::MB5_GeluErf, 0);
 
+    uint32_t fma_iters = 4096u, sfu_iters = 512u, wave_iters = 2048u;
     {
-        constexpr uint32_t kGroups = 256, kIters = 4096;
-        std::array<Scalar32, 4> sc{
-            Scalar32::U32(kIters), Scalar32::F32(1.000001f), Scalar32::F32(0.000001f), Scalar32::F32(-999999.0f)};
+        std::array<Scalar32, 4> psc{Scalar32::U32(256u), Scalar32::F32(1.000001f), Scalar32::F32(0.000001f), Scalar32::F32(-999999.0f)};
+        auto pr = backend_.execute({krn_fma, bufs, psc, {32, 1, 1}, {kLocalSize, 1, 1}, 1, false});
+        double est_gf = (static_cast<double>(32 * kLocalSize) * 256.0 * 32.0) / std::max(100.0, pr.gpu_execution_ns);
+        if (est_gf < 50.0) { fma_iters = 256u; sfu_iters = 64u; wave_iters = 256u; }
+        else if (est_gf < 500.0) { fma_iters = 1024u; sfu_iters = 128u; wave_iters = 512u; }
+    }
+    {
+        uint32_t kGroups = (fma_iters <= 256u) ? 64u : 256u;
+        std::array<Scalar32, 4> sc{Scalar32::U32(fma_iters), Scalar32::F32(1.000001f), Scalar32::F32(0.000001f), Scalar32::F32(-999999.0f)};
         DispatchDesc d{krn_fma, bufs, sc, {kGroups, 1, 1}, {kLocalSize, 1, 1}, 1, false};
-        for (int w = 0; w < 4; ++w) {
-            backend_.execute(d);
-        }
-        double flops = static_cast<double>(kGroups * kLocalSize) * static_cast<double>(kIters) * 32.0;
+        for (int w = 0; w < 2; ++w) backend_.execute(d);
+        double flops = static_cast<double>(kGroups * kLocalSize) * static_cast<double>(fma_iters) * 32.0;
         std::vector<double> samples;
         for (uint32_t it = 0; it < cfg_.timed_iters; ++it) {
             samples.push_back(flops / backend_.execute(d).gpu_execution_ns);
+            if (it >= 5 && calc_median_iqr(samples).iqr <= 0.012 * calc_median_iqr(samples).median) break;
         }
         out.pi_fma_gflops = calc_median_iqr(samples).median;
     }
 
     auto measure_sfu = [&](KernelHandle krn) {
-        constexpr uint32_t kGroups = 256, kIters = 512;
+        uint32_t kGroups = (sfu_iters <= 64u) ? 64u : 256u, kIters = sfu_iters;
         std::array<Scalar32, 4> sc{
             Scalar32::U32(kIters), Scalar32::F32(0.5f), Scalar32::F32(0.3f), Scalar32::F32(-999999.0f)};
         DispatchDesc d{krn, bufs, sc, {kGroups, 1, 1}, {kLocalSize, 1, 1}, 1, false};
@@ -414,6 +445,7 @@ void Calibrator::run_mb5_compute_and_waves(DeviceProfile& out) {
         std::vector<double> samples;
         for (uint32_t it = 0; it < 15; ++it) {
             samples.push_back(elems / backend_.execute(d).gpu_execution_ns);
+            if (it >= 5 && calc_median_iqr(samples).iqr <= 0.012 * calc_median_iqr(samples).median) break;
         }
         return calc_median_iqr(samples).median;
     };
@@ -425,7 +457,7 @@ void Calibrator::run_mb5_compute_and_waves(DeviceProfile& out) {
     out.wave_curve.clear();
     double peak_wave_gflops = 0.0;
     for (uint32_t g : grid_sizes) {
-        constexpr uint32_t kIters = 2048;
+        const uint32_t kIters = wave_iters;
         std::array<Scalar32, 4> sc{
             Scalar32::U32(kIters), Scalar32::F32(1.000001f), Scalar32::F32(0.000001f), Scalar32::F32(-999999.0f)};
         DispatchDesc d{krn_fma, bufs, sc, {g, 1, 1}, {kLocalSize, 1, 1}, 1, false};
@@ -434,11 +466,17 @@ void Calibrator::run_mb5_compute_and_waves(DeviceProfile& out) {
         std::vector<double> ns_vec;
         for (int it = 0; it < 9; ++it) {
             ns_vec.push_back(backend_.execute(d).gpu_execution_ns);
+            if (it >= 4 && calc_median_iqr(ns_vec).iqr <= 0.015 * calc_median_iqr(ns_vec).median) break;
         }
         double med_ns    = calc_median_iqr(ns_vec).median;
         double gf        = flops / med_ns;
         peak_wave_gflops = std::max(peak_wave_gflops, gf);
         out.wave_curve.push_back({g, gf, med_ns * 1e-3});
+        bool jump_seen = false;
+        for (size_t wi = 0; wi + 1 < out.wave_curve.size(); ++wi)
+            if (out.wave_curve[wi + 1].gpu_time_us > 1.35 * out.wave_curve[wi].gpu_time_us) jump_seen = true;
+        if (jump_seen && out.wave_curve.size() >= 8 && gf >= 0.95 * out.pi_fma_gflops) break;
+        if (out.wave_curve.size() >= 6 && med_ns > 10000000.0 && gf >= 0.90 * out.pi_fma_gflops) break;
     }
     out.pi_fma_gflops = std::max(out.pi_fma_gflops, peak_wave_gflops);
 
@@ -518,6 +556,9 @@ void Calibrator::run_mb6_compile_ols(DeviceProfile& out, BufferHandle shared_src
         std::vector<double> total_drv_samples;
 
         for (uint32_t s = 0; s < cfg_.compile_samples; ++s) {
+            if (s >= 2 && total_drv_samples.back() > 150.0) break;
+            if (s >= 3 && (total_drv_samples.back() > 25.0 ||
+                calc_median_iqr(total_drv_samples).iqr <= 0.02 * calc_median_iqr(total_drv_samples).median)) break;
             uint32_t salt    = ((rng() & 0x007FFFFEu) | 1u);
             double comp_ns   = 0.0;
             KernelHandle krn = backend_.compile_kernel(ps.id, salt, &comp_ns);
@@ -562,6 +603,7 @@ void Calibrator::run_mb6_compile_ols(DeviceProfile& out, BufferHandle shared_src
             size_t measured_words = 0;
             uint32_t fe_runs      = std::min<uint32_t>(cfg_.compile_samples, 3u);
             for (uint32_t s = 0; s < fe_runs; ++s) {
+                if (s >= 1 && !fe_samples.empty() && fe_samples.back() > 80.0) break;
                 uint32_t salt = ((rng() & 0x007FFFFEu) | 1u);
                 double fe_ms  = 0.0;
                 if (fe_probe_->measure_compile_ms(ps.id, salt, &fe_ms, &measured_words)) {
