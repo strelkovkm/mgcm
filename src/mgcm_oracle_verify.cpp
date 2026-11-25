@@ -172,6 +172,7 @@ int main(int argc, char** argv) {
             cfg.N = N;
             cfg.K = K;
             cfg.transpose_b = false;
+            cfg.is_dynamic_m = true;
             cfg.activation = is_erf ? mgcm::EpilogueProfile::gelu_erf() : mgcm::EpilogueProfile::relu();
             cfg.schedule = mgcm::MatmulSchedule::tiled_64x64_smem();
             cfg.frontend = mgcm::CompilerKind::Slang;

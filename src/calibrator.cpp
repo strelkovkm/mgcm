@@ -439,11 +439,12 @@ void Calibrator::run_mb5_compute_and_waves(DeviceProfile& out) {
     out.g_wave_quantum  = grid_sizes.front();
     out.pi_wave1_gflops = out.wave_curve.front().gflops;
     if (out.wave_curve.size() >= 2) {
-        double base_us = out.wave_curve.front().gpu_time_us;
+        double min_us = out.wave_curve.front().gpu_time_us;
         for (size_t i = 0; i + 1 < out.wave_curve.size(); ++i) {
             double curr_us = out.wave_curve[i].gpu_time_us;
             double next_us = out.wave_curve[i + 1].gpu_time_us;
-            if (next_us > 1.35 * curr_us && next_us > 1.35 * base_us) {
+            min_us = std::min(min_us, curr_us);
+            if (next_us > 1.35 * curr_us && next_us > 1.35 * min_us) {
                 out.g_wave_quantum  = out.wave_curve[i].workgroups;
                 out.pi_wave1_gflops = out.wave_curve[i].gflops;
                 break;
