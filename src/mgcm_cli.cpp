@@ -51,7 +51,7 @@ void run_evaluation_report(const std::string& json_path, const std::string& phas
                        mgcm::MatmulSchedule sched, bool cached, uint32_t k_same) {
         mgcm::MlpConfig c{};
         c.M = m; c.N = n; c.K = k; c.transpose_b = trb; c.activation = act; c.schedule = sched;
-        c.frontend = mgcm::CompilerKind::Slang; c.fe_cached = true; c.base_mm_drv_cached = cached; c.instance_count = k_same;
+        c.frontend = mgcm::CompilerKind::Slang; c.fe_cached = cached; c.base_mm_drv_cached = cached; c.instance_count = k_same;
         return c;
     };
 

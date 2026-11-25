@@ -33,7 +33,7 @@ cmake -G Ninja \
     -DANDROID_STL=c++_static \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-    -DMGCM_COMPILE_SLANG=OFF
+    -DMGCM_COMPILE_SLANG=ON
 
 cmake --build "${BUILD_DIR}" --target mgcm_cli -j "$(nproc)"
 file "${BUILD_DIR}/mgcm_cli"

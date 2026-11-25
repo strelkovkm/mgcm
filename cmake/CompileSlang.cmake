@@ -1,7 +1,7 @@
 function(mgcm_add_slang_shader OUT_HEADERS_VAR SLANG_REL_PATH ENTRY_NAME VAR_NAME)
     set(SRC_FILE "${CMAKE_CURRENT_SOURCE_DIR}/${SLANG_REL_PATH}")
     set(SPV_FILE "${CMAKE_CURRENT_BINARY_DIR}/spv/${VAR_NAME}.spv")
-    set(HDR_FILE "${CMAKE_CURRENT_SOURCE_DIR}/shaders/generated_spirv/${VAR_NAME}.hpp")
+    set(HDR_FILE "${CMAKE_CURRENT_BINARY_DIR}/generated_spirv/${VAR_NAME}.hpp")
 
     if(MGCM_COMPILE_SLANG)
         set(VAL_CMD "")

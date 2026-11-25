@@ -12,11 +12,11 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 if(MGCM_COMPILE_SLANG)
     find_program(SLANGC_EXECUTABLE NAMES slangc
-        HINTS "$ENV{HOME}/dev/ov_research/tools/slang/bin" "$ENV{HOME}/.local/opt/slang/bin")
+        HINTS "$ENV{HOME}/dev/ov_research/tools/slang/bin" "$ENV{HOME}/.local/opt/slang/bin" NO_CMAKE_FIND_ROOT_PATH)
     if(NOT SLANGC_EXECUTABLE)
         message(FATAL_ERROR "slangc not found! Set -DSLANGC_EXECUTABLE=/path/to/slangc or -DMGCM_COMPILE_SLANG=OFF")
     endif()
-    find_program(SPIRV_VAL_EXECUTABLE NAMES spirv-val)
+    find_program(SPIRV_VAL_EXECUTABLE NAMES spirv-val NO_CMAKE_FIND_ROOT_PATH)
     message(STATUS "Found slangc: ${SLANGC_EXECUTABLE}")
     message(STATUS "Found spirv-val: ${SPIRV_VAL_EXECUTABLE}")
 endif()
@@ -66,7 +66,7 @@ add_library(mgcm_core STATIC ${MGCM_SOURCES} ${MGCM_GENERATED_SPV_HEADERS})
 add_dependencies(mgcm_core mgcm_shaders)
 target_include_directories(mgcm_core
     PUBLIC  "${CMAKE_CURRENT_SOURCE_DIR}/include"
-    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/shaders/generated_spirv"
+    PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated_spirv"
 )
 target_link_libraries(mgcm_core PUBLIC mgcm_json)
 if(MGCM_ENABLE_VULKAN)
