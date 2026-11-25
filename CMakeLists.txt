@@ -41,6 +41,7 @@ mgcm_add_slang_shader(MGCM_GENERATED_SPV_HEADERS "shaders/slang/mb1_dispatch.sla
 mgcm_add_slang_shader(MGCM_GENERATED_SPV_HEADERS "shaders/slang/mb2_cache_bw.slang"     "mb2_stream_vec4"          "mb2_stream_vec4")
 mgcm_add_slang_shader(MGCM_GENERATED_SPV_HEADERS "shaders/slang/mb3_stride.slang"       "mb3_stride_f32"           "mb3_stride_f32")
 mgcm_add_slang_shader(MGCM_GENERATED_SPV_HEADERS "shaders/slang/mb4_tiled_matmul.slang" "mb4_matmul_smem"          "mb4_matmul_smem")
+mgcm_add_slang_shader(MGCM_GENERATED_SPV_HEADERS "shaders/slang/mb4_tiled_matmul.slang" "mb4_matmul_smem_tail"     "mb4_matmul_smem_tail")
 mgcm_add_slang_shader(MGCM_GENERATED_SPV_HEADERS "shaders/slang/mb4_tiled_matmul.slang" "mb4_matmul_cache"         "mb4_matmul_cache")
 mgcm_add_slang_shader(MGCM_GENERATED_SPV_HEADERS "shaders/slang/mb4_tiled_matmul.slang" "mb6_matmul_fused_gelu_erf" "mb6_matmul_fused_gelu_erf")
 mgcm_add_slang_shader(MGCM_GENERATED_SPV_HEADERS "shaders/slang/mb5_compute.slang"      "mb5_fma16"                "mb5_fma16")
@@ -49,7 +50,13 @@ mgcm_add_slang_shader(MGCM_GENERATED_SPV_HEADERS "shaders/slang/mb5_compute.slan
 
 add_custom_target(mgcm_shaders DEPENDS ${MGCM_GENERATED_SPV_HEADERS})
 
-set(MGCM_SOURCES src/calibrator.cpp src/cost_model.cpp)
+set(MGCM_SOURCES
+    src/calibrator.cpp
+    src/profile_cache.cpp
+    src/blocks/mlp_block.cpp
+    src/cost_model.cpp
+    src/frontends/slang_probe.cpp
+)
 if(MGCM_ENABLE_VULKAN)
     find_package(Vulkan REQUIRED)
     list(APPEND MGCM_SOURCES src/backends/vulkan/vulkan_backend.cpp)
@@ -69,6 +76,24 @@ endif()
 
 add_executable(mgcm_cli src/mgcm_cli.cpp)
 target_link_libraries(mgcm_cli PRIVATE mgcm_core)
+
+if(NOT CMAKE_CROSSCOMPILING)
+    find_path(SLANG_INCLUDE_DIR NAMES slang.h
+        HINTS "$ENV{HOME}/dev/ov_research/tools/slang/include" "$ENV{HOME}/.local/opt/slang/include")
+    find_library(SLANG_LIBRARY NAMES slang
+        HINTS "$ENV{HOME}/dev/ov_research/tools/slang/lib" "$ENV{HOME}/.local/opt/slang/lib")
+    if(SLANG_INCLUDE_DIR AND SLANG_LIBRARY)
+        message(STATUS "Found libslang in-process API: ${SLANG_LIBRARY}")
+        get_filename_component(SLANG_LIB_DIR "${SLANG_LIBRARY}" DIRECTORY)
+        target_compile_definitions(mgcm_core PRIVATE
+            MGCM_HAS_SLANG_API=1
+            MGCM_SLANG_SHADER_DIR="${CMAKE_CURRENT_SOURCE_DIR}/shaders/slang")
+        target_include_directories(mgcm_core PRIVATE "${SLANG_INCLUDE_DIR}")
+        target_link_libraries(mgcm_core PRIVATE "${SLANG_LIBRARY}")
+        set_target_properties(mgcm_cli PROPERTIES BUILD_RPATH "${SLANG_LIB_DIR}")
+    endif()
+endif()
+
 
 enable_testing()
 add_executable(test_cost_model tests/test_cost_model.cpp)

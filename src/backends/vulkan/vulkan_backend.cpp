@@ -9,6 +9,7 @@
 #include "mb3_stride_f32.hpp"
 #include "mb4_matmul_cache.hpp"
 #include "mb4_matmul_smem.hpp"
+#include "mb4_matmul_smem_tail.hpp"
 #include "mb5_fma16.hpp"
 #include "mb5_gelu_erf.hpp"
 #include "mb5_gelu_tanh.hpp"
@@ -150,6 +151,9 @@ std::span<const uint32_t> get_builtin_spirv(BenchKernelId id, const char** out_e
         case BenchKernelId::MB4_MatmulSmem:
             *out_entry = "mb4_matmul_smem";
             return spirv::k_mb4_matmul_smem;
+        case BenchKernelId::MB4_MatmulSmemTail:
+            *out_entry = "mb4_matmul_smem_tail";
+            return spirv::k_mb4_matmul_smem_tail;
         case BenchKernelId::MB4_MatmulDirectCache:
             *out_entry = "mb4_matmul_cache";
             return spirv::k_mb4_matmul_cache;
@@ -182,6 +186,7 @@ struct VulkanBackend::Impl {
     VkFence                   fence                     = VK_NULL_HANDLE;
     VkQueryPool               query_pool                = VK_NULL_HANDLE;
     VkDescriptorPool          desc_pool                 = VK_NULL_HANDLE;
+    bool                      owns_device               = true;
     bool                      use_sync2                 = false;
     PFN_vkCmdPipelineBarrier2 pfn_cmd_pipeline_barrier2 = nullptr;
     PFN_vkCmdWriteTimestamp2  pfn_cmd_write_timestamp2  = nullptr;
@@ -462,8 +467,10 @@ VulkanBackend::~VulkanBackend() {
     vkDestroyQueryPool(impl_->device, impl_->query_pool, nullptr);
     vkDestroyFence(impl_->device, impl_->fence, nullptr);
     vkDestroyCommandPool(impl_->device, impl_->cmd_pool, nullptr);
-    vkDestroyDevice(impl_->device, nullptr);
-    vkDestroyInstance(impl_->instance, nullptr);
+    if (impl_->owns_device) {
+        vkDestroyDevice(impl_->device, nullptr);
+        vkDestroyInstance(impl_->instance, nullptr);
+    }
 }
 
 StaticDeviceProps VulkanBackend::query_static_props() const { return impl_->props; }
@@ -708,6 +715,175 @@ TimingResult VulkanBackend::execute(const DispatchDesc& desc) {
     tr.cpu_wall_ns      = std::chrono::duration<double, std::nano>(cpu_t1 - cpu_t0).count();
     tr.gpu_execution_ns = static_cast<double>(ts[1] - ts[0]) * impl_->props.timestamp_period_ns;
     return tr;
+}
+
+
+std::unique_ptr<VulkanBackend> VulkanBackend::from_external(const ExternalVulkanHandles& handles) {
+    return std::unique_ptr<VulkanBackend>(new VulkanBackend(handles));
+}
+
+VulkanBackend::VulkanBackend(const ExternalVulkanHandles& ext) : impl_(std::make_unique<Impl>()) {
+    if (!ext.instance || !ext.physical_device || !ext.device || !ext.queue) {
+        throw std::runtime_error("ExternalVulkanHandles contains null handles");
+    }
+    impl_->owns_device  = false;
+    impl_->instance     = reinterpret_cast<VkInstance>(ext.instance);
+    impl_->phys_dev     = reinterpret_cast<VkPhysicalDevice>(ext.physical_device);
+    impl_->device       = reinterpret_cast<VkDevice>(ext.device);
+    impl_->queue        = reinterpret_cast<VkQueue>(ext.queue);
+    impl_->queue_family = ext.queue_family_idx;
+
+    VkPhysicalDeviceProperties base_pr{};
+    vkGetPhysicalDeviceProperties(impl_->phys_dev, &base_pr);
+    uint32_t dev_api = base_pr.apiVersion;
+
+    VkPhysicalDeviceVulkan13Properties p13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES};
+    VkPhysicalDeviceVulkan12Properties p12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
+    VkPhysicalDeviceVulkan11Properties p11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES};
+    if (dev_api >= VK_API_VERSION_1_3) { p11.pNext = &p12; p12.pNext = &p13; }
+    else if (dev_api >= VK_API_VERSION_1_2) { p11.pNext = &p12; }
+
+    VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &p11};
+    auto pfn_gpdp2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+        vkGetInstanceProcAddr(impl_->instance, "vkGetPhysicalDeviceProperties2"));
+    if (pfn_gpdp2 && dev_api >= VK_API_VERSION_1_1) { pfn_gpdp2(impl_->phys_dev, &p2); }
+    else { p2.properties = base_pr; }
+
+    VkPhysicalDeviceMemoryProperties mem_props{};
+    vkGetPhysicalDeviceMemoryProperties(impl_->phys_dev, &mem_props);
+    uint64_t dev_local_bytes = 0;
+    for (uint32_t h = 0; h < mem_props.memoryHeapCount; ++h) {
+        if (mem_props.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+            dev_local_bytes = std::max<uint64_t>(dev_local_bytes, mem_props.memoryHeaps[h].size);
+        }
+    }
+
+    auto& sp                    = impl_->props;
+    sp.runtime                  = RuntimeKind::Vulkan;
+    sp.device_name              = p2.properties.deviceName;
+    sp.api_version_str          = format_vk_version(dev_api);
+    sp.driver_name              = (dev_api >= VK_API_VERSION_1_2 && p12.driverName[0] != '\0')
+                                      ? (std::string(p12.driverName) + " / VK " + sp.api_version_str)
+                                      : ("VK " + sp.api_version_str);
+    sp.vendor_id                = p2.properties.vendorID;
+    sp.device_id                = p2.properties.deviceID;
+    sp.device_uuid_hex          = uuid_to_hex(p11.deviceUUID);
+    sp.driver_uuid_hex          = uuid_to_hex(p11.driverUUID);
+    sp.is_integrated_uma        = (p2.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) ||
+                                  (mem_props.memoryHeapCount == 1);
+    sp.subgroup_size            = (p11.subgroupSize > 0) ? p11.subgroupSize : 16u;
+    sp.min_subgroup_size        = (dev_api >= VK_API_VERSION_1_3 && p13.minSubgroupSize > 0) ? p13.minSubgroupSize : sp.subgroup_size;
+    sp.max_subgroup_size        = (dev_api >= VK_API_VERSION_1_3 && p13.maxSubgroupSize > 0) ? p13.maxSubgroupSize : sp.subgroup_size;
+    sp.max_wg_invocations       = p2.properties.limits.maxComputeWorkGroupInvocations;
+    sp.max_shared_mem_bytes     = p2.properties.limits.maxComputeSharedMemorySize;
+    sp.max_push_constants_size  = p2.properties.limits.maxPushConstantsSize;
+    sp.max_storage_buffer_range = p2.properties.limits.maxStorageBufferRange;
+    sp.device_local_mem_bytes   = dev_local_bytes;
+    sp.timestamp_period_ns      = static_cast<double>(p2.properties.limits.timestampPeriod);
+
+    impl_->pfn_cmd_pipeline_barrier2 =
+        reinterpret_cast<PFN_vkCmdPipelineBarrier2>(vkGetDeviceProcAddr(impl_->device, "vkCmdPipelineBarrier2"));
+    impl_->pfn_cmd_write_timestamp2 =
+        reinterpret_cast<PFN_vkCmdWriteTimestamp2>(vkGetDeviceProcAddr(impl_->device, "vkCmdWriteTimestamp2"));
+    impl_->use_sync2 = (dev_api >= VK_API_VERSION_1_3 && impl_->pfn_cmd_pipeline_barrier2 && impl_->pfn_cmd_write_timestamp2);
+
+    VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    cpci.flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    cpci.queueFamilyIndex = impl_->queue_family;
+    VK_CHECK(vkCreateCommandPool(impl_->device, &cpci, nullptr, &impl_->cmd_pool));
+
+    VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cbai.commandPool        = impl_->cmd_pool;
+    cbai.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbai.commandBufferCount = 1;
+    VK_CHECK(vkAllocateCommandBuffers(impl_->device, &cbai, &impl_->cmd_buf));
+
+    VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VK_CHECK(vkCreateFence(impl_->device, &fci, nullptr, &impl_->fence));
+
+    VkQueryPoolCreateInfo qpci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    qpci.queryType  = VK_QUERY_TYPE_TIMESTAMP;
+    qpci.queryCount = 2;
+    VK_CHECK(vkCreateQueryPool(impl_->device, &qpci, nullptr, &impl_->query_pool));
+
+    VkDescriptorPoolSize pool_sz{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 256};
+    VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpci.flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    dpci.maxSets       = 64;
+    dpci.poolSizeCount = 1;
+    dpci.pPoolSizes    = &pool_sz;
+    VK_CHECK(vkCreateDescriptorPool(impl_->device, &dpci, nullptr, &impl_->desc_pool));
+}
+
+size_t VulkanBackend::get_kernel_spirv_words(BenchKernelId id) const {
+    const char* entry = nullptr;
+    return get_builtin_spirv(id, &entry).size();
+}
+
+double VulkanBackend::measure_pipeline_cache_hit_ms(BenchKernelId id) {
+    const char* entry_name = nullptr;
+    auto base_spv          = get_builtin_spirv(id, &entry_name);
+    std::vector<uint32_t> words(base_spv.begin(), base_spv.end());
+    auto refl = parse_and_validate_canonical_abi(words, 0);
+
+    std::vector<VkDescriptorSetLayoutBinding> bindings(refl.num_bindings);
+    for (uint32_t b = 0; b < refl.num_bindings; ++b) {
+        bindings[b] = {b, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    }
+    VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+    VkDescriptorSetLayoutCreateInfo slci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    slci.bindingCount = refl.num_bindings;
+    slci.pBindings    = bindings.data();
+    VK_CHECK(vkCreateDescriptorSetLayout(impl_->device, &slci, nullptr, &set_layout));
+
+    VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 128};
+    VkPipelineLayout pipe_layout = VK_NULL_HANDLE;
+    VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    plci.setLayoutCount         = 1;
+    plci.pSetLayouts            = &set_layout;
+    plci.pushConstantRangeCount = 1;
+    plci.pPushConstantRanges    = &pcr;
+    VK_CHECK(vkCreatePipelineLayout(impl_->device, &plci, nullptr, &pipe_layout));
+
+    VkShaderModule shader = VK_NULL_HANDLE;
+    VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    smci.codeSize = words.size() * sizeof(uint32_t);
+    smci.pCode    = words.data();
+    VK_CHECK(vkCreateShaderModule(impl_->device, &smci, nullptr, &shader));
+
+    VkPipelineCache cache = VK_NULL_HANDLE;
+    VkPipelineCacheCreateInfo pcci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    VK_CHECK(vkCreatePipelineCache(impl_->device, &pcci, nullptr, &cache));
+
+    VkComputePipelineCreateInfo cpci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    cpci.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpci.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpci.stage.module = shader;
+    cpci.stage.pName  = entry_name;
+    cpci.layout       = pipe_layout;
+
+    // Warm up VkPipelineCache once
+    VkPipeline warm = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateComputePipelines(impl_->device, cache, 1, &cpci, nullptr, &warm));
+    vkDestroyPipeline(impl_->device, warm, nullptr);
+
+    std::vector<double> hit_ms;
+    for (int it = 0; it < 15; ++it) {
+        VkPipeline p = VK_NULL_HANDLE;
+        auto t0      = std::chrono::steady_clock::now();
+        VK_CHECK(vkCreateComputePipelines(impl_->device, cache, 1, &cpci, nullptr, &p));
+        auto t1 = std::chrono::steady_clock::now();
+        hit_ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        vkDestroyPipeline(impl_->device, p, nullptr);
+    }
+
+    vkDestroyPipelineCache(impl_->device, cache, nullptr);
+    vkDestroyShaderModule(impl_->device, shader, nullptr);
+    vkDestroyPipelineLayout(impl_->device, pipe_layout, nullptr);
+    vkDestroyDescriptorSetLayout(impl_->device, set_layout, nullptr);
+
+    std::sort(hit_ms.begin(), hit_ms.end());
+    return hit_ms[hit_ms.size() / 2];
 }
 
 } // namespace mgcm

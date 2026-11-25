@@ -1,44 +1,18 @@
 #pragma once
+#include "mgcm/blocks/mlp_block.hpp"
 #include "mgcm/device_profile.hpp"
-#include <array>
+#include "mgcm/topology_policy.hpp"
+#include "mgcm/workload.hpp"
 #include <cstdint>
+#include <vector>
 
 namespace mgcm {
 
-enum class PartitionPlan : uint8_t {
-    P0_SplitAll       = 0, // {MatMul} | {Add} | {Gelu}
-    P1_FusedBias      = 1, // {MatMul + Add} | {Gelu}
-    P2_FusedEpilogue  = 2, // {MatMul} | {Add + Gelu}
-    P3_FullFusion     = 3  // {MatMul + Add + Gelu}
-};
-
-inline const char* to_string(PartitionPlan p) {
-    switch (p) {
-        case PartitionPlan::P0_SplitAll:      return "P0_SplitAll";
-        case PartitionPlan::P1_FusedBias:     return "P1_FusedBias";
-        case PartitionPlan::P2_FusedEpilogue: return "P2_FusedEpilogue";
-        case PartitionPlan::P3_FullFusion:    return "P3_FullFusion";
-    }
-    return "Unknown";
-}
-
-enum class GeluKind : uint8_t { Erf = 0, Tanh = 1 };
-
 enum class AblationMode : uint8_t {
-    None               = 0, // Full analytical Cost Model C(P, R)
-    NoMemoryTraffic    = 1, // Ignore memory hierarchy & intermediate tensor traffic
-    NoDispatchOverhead = 2, // Ignore kernel launch & barrier overheads
-    NoCompileCost      = 3  // Ignore shader compilation latency (R -> inf greedy)
-};
-
-struct SubgraphQuery {
-    uint32_t M                     = 128;
-    uint32_t N                     = 512;
-    uint32_t K                     = 256;
-    bool     transpose_b           = false;
-    GeluKind gelu                  = GeluKind::Erf;
-    bool     tiled_matmul          = true;  // 64x64 2D-tiled vs naive 1-thread-per-output
-    bool     base_primitives_cached = false; // e.g. split MatMul already in pipeline cache
+    None               = 0,
+    NoMemoryTraffic    = 1,
+    NoDispatchOverhead = 2,
+    NoCompileCost      = 3
 };
 
 struct PlanEstimate {
@@ -49,33 +23,59 @@ struct PlanEstimate {
     double        t_memory_us   = 0.0;
     double        t_dispatch_us = 0.0;
 
-    double total_cost_us(uint64_t r_runs) const {
-        return t_compile_us + static_cast<double>(r_runs) * t_execute_us;
+    double total_cost_us(uint64_t r_effective) const {
+        return t_compile_us + static_cast<double>(r_effective) * t_execute_us;
     }
 };
 
-class CostModel {
+struct HorizonSegment {
+    uint64_t      r_start_inclusive = 1;
+    uint64_t      r_end_exclusive   = 0; // 0 denotes +infinity
+    PartitionPlan plan              = PartitionPlan::P0_SplitAll;
+};
+
+struct DynamicMDecision {
+    bool          has_crossover = false;
+    uint32_t      m_threshold   = 0;
+    PartitionPlan low_m_plan    = PartitionPlan::P0_SplitAll;
+    PartitionPlan high_m_plan   = PartitionPlan::P3_FullFusion;
+};
+
+class UniversalCostEngine {
 public:
-    explicit CostModel(DeviceProfile profile);
+    explicit UniversalCostEngine(DeviceProfile profile);
+    UniversalCostEngine(DeviceProfile profile, TopologyPolicy topology);
 
-    const DeviceProfile& profile() const { return prof_; }
+    const DeviceProfile&  profile() const { return prof_; }
+    const TopologyPolicy& topology() const { return topo_; }
 
-    PlanEstimate              estimate_plan(const SubgraphQuery& q, PartitionPlan plan,
-                                            AblationMode ablation = AblationMode::None) const;
-    std::array<PlanEstimate, 4> evaluate_all(const SubgraphQuery& q,
+    double       empirical_bw_gbps(double working_set_bytes, uint32_t stride_elems = 1) const;
+    PlanEstimate estimate_partition(const PartitionWorkload& pw, AblationMode ablation = AblationMode::None) const;
+
+    std::vector<PlanEstimate> evaluate_block(const IBlockModel& block,
                                              AblationMode ablation = AblationMode::None) const;
-    PartitionPlan             select_optimal(const SubgraphQuery& q, uint64_t r_runs = 1,
+    PartitionPlan             select_optimal(const IBlockModel& block, uint64_t model_r_runs = 1,
                                              AblationMode ablation = AblationMode::None) const;
 
-    // Break-even reuse count R* where candidate_plan becomes cheaper than reference_plan (0 if always cheaper, -1 if never)
-    double compute_break_even_r(const SubgraphQuery& q, PartitionPlan candidate_plan,
-                                PartitionPlan reference_plan) const;
+    // Exact Lower Envelope over R_model in [1, +inf) accounting for block.instance_count()
+    std::vector<HorizonSegment> compute_horizon(const IBlockModel& block,
+                                                AblationMode ablation = AblationMode::None) const;
+
+    double compute_break_even_r(const IBlockModel& block, PartitionPlan candidate_plan,
+                                PartitionPlan reference_plan,
+                                AblationMode ablation = AblationMode::None) const;
+
+    // Dynamic-M analysis: finds crossover threshold M* in [m_min, m_max] for fixed model_r_runs
+    DynamicMDecision analyze_dynamic_m(const MlpConfig& base_cfg, uint32_t m_min, uint32_t m_max,
+                                       uint64_t model_r_runs = 1,
+                                       AblationMode ablation = AblationMode::None) const;
 
 private:
-    double l2_hit_fraction(double working_set_bytes) const;
-    double effective_bw_gbps(double working_set_bytes, bool strided32) const;
+    double wave_occupancy(uint32_t workgroups) const;
+    double kernel_compile_ms(const KernelWorkload& kw) const;
 
-    DeviceProfile prof_;
+    DeviceProfile  prof_;
+    TopologyPolicy topo_;
 };
 
 } // namespace mgcm

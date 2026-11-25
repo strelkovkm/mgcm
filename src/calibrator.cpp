@@ -3,10 +3,12 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <numeric>
 #include <random>
 
 namespace mgcm {
@@ -32,9 +34,60 @@ RobustStats calc_median_iqr(std::vector<double> v) {
     return {pct(0.50), pct(0.75) - pct(0.25)};
 }
 
+struct OlsFit {
+    double intercept = 0.0;
+    double slope     = 0.0;
+    double r2        = 0.0;
+};
+
+OlsFit fit_ols_1d(const std::vector<double>& xs, const std::vector<double>& ys, bool non_negative_intercept = true) {
+    const size_t n = xs.size();
+    if (n < 2 || ys.size() != n) {
+        return {};
+    }
+    double x_mean = std::accumulate(xs.begin(), xs.end(), 0.0) / static_cast<double>(n);
+    double y_mean = std::accumulate(ys.begin(), ys.end(), 0.0) / static_cast<double>(n);
+
+    double sxx = 0.0, sxy = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        double dx = xs[i] - x_mean;
+        double dy = ys[i] - y_mean;
+        sxx += dx * dx;
+        sxy += dx * dy;
+    }
+
+    OlsFit fit{};
+    fit.slope     = (sxx > 1e-12) ? (sxy / sxx) : 0.0;
+    fit.intercept = y_mean - fit.slope * x_mean;
+
+    if (non_negative_intercept && fit.intercept < 0.0) {
+        // Physical guard: refit ray through origin when unconstrained intercept dips below zero
+        double sum_xy = 0.0, sum_xx = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            sum_xy += xs[i] * ys[i];
+            sum_xx += xs[i] * xs[i];
+        }
+        fit.intercept = 0.0;
+        fit.slope     = (sum_xx > 1e-12) ? std::max(0.0, sum_xy / sum_xx) : 0.0;
+    }
+    fit.slope = std::max(0.0, fit.slope);
+
+    double ss_res = 0.0, ss_tot = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        double y_hat = fit.intercept + fit.slope * xs[i];
+        double err   = ys[i] - y_hat;
+        double dev   = ys[i] - y_mean;
+        ss_res += err * err;
+        ss_tot += dev * dev;
+    }
+    fit.r2 = (ss_tot > 1e-12) ? std::clamp(1.0 - ss_res / ss_tot, 0.0, 1.0) : 1.0;
+    return fit;
+}
+
 } // namespace
 
-Calibrator::Calibrator(ICalibBackend& backend, CalibratorConfig cfg) : backend_(backend), cfg_(cfg) {}
+Calibrator::Calibrator(ICalibBackend& backend, IFrontendCompilerProbe* fe_probe, CalibratorConfig cfg)
+    : backend_(backend), fe_probe_(fe_probe), cfg_(cfg) {}
 
 void Calibrator::run_warmup() {
     BufferHandle buf = backend_.allocate_buffer(64 * 1024);
@@ -47,8 +100,7 @@ void Calibrator::run_warmup() {
 
     double elapsed_ms = 0.0;
     while (elapsed_ms < cfg_.warmup_ms) {
-        auto tr = backend_.execute(d);
-        elapsed_ms += tr.cpu_wall_ns * 1e-6;
+        elapsed_ms += backend_.execute(d).cpu_wall_ns * 1e-6;
     }
     backend_.destroy_kernel(krn);
     backend_.free_buffer(buf);
@@ -57,7 +109,6 @@ void Calibrator::run_warmup() {
 void Calibrator::run_mb1_dispatch(DeviceProfile& out) {
     BufferHandle buf = backend_.allocate_buffer(4096);
     KernelHandle krn = backend_.compile_kernel(BenchKernelId::MB1_DispatchNoop, 0);
-
     std::array<BufferHandle, 1> bufs{buf};
     std::array<Scalar32, 2> scalars{Scalar32::U32(1), Scalar32::F32(-999999.0f)};
 
@@ -75,22 +126,35 @@ void Calibrator::run_mb1_dispatch(DeviceProfile& out) {
         return std::pair{calc_median_iqr(cpu_us).median, calc_median_iqr(gpu_us).median};
     };
 
-    auto [cpu_1, gpu_nobar_1]     = measure_chain(1, false);
-    auto [cpu_128, gpu_nobar_128] = measure_chain(128, false);
-    auto [cpu_b1, gpu_bar_1]      = measure_chain(1, true);
-    auto [cpu_b128, gpu_bar_128]  = measure_chain(128, true);
+    const std::vector<uint32_t> chain_lens = {1, 8, 32, 128};
+    std::vector<double> xs, y_nobar, y_bar;
+    double cpu_1 = 0.0, gpu_1 = 0.0;
 
-    double slope_nobar = (gpu_nobar_128 - gpu_nobar_1) / 127.0;
-    double slope_bar   = (gpu_bar_128 - gpu_bar_1) / 127.0;
+    for (uint32_t n : chain_lens) {
+        auto [c_nb, g_nb] = measure_chain(n, false);
+        auto [c_b, g_b]   = measure_chain(n, true);
+        (void)c_b;
+        if (n == 1) {
+            cpu_1 = c_nb;
+            gpu_1 = g_nb;
+        }
+        xs.push_back(static_cast<double>(n));
+        y_nobar.push_back(g_nb);
+        y_bar.push_back(g_b);
+    }
 
-    out.t_launch_gpu_us  = std::max(0.0, slope_nobar);
-    out.t_barrier_gpu_us = std::max(0.0, slope_bar - slope_nobar);
-    out.t_submit_cpu_us  = std::max(0.0, cpu_1 - gpu_nobar_1);
+    auto fit_nb = fit_ols_1d(xs, y_nobar, false);
+    auto fit_b  = fit_ols_1d(xs, y_bar, false);
+
+    out.t_launch_gpu_us  = std::max(0.0, fit_nb.slope);
+    out.t_barrier_gpu_us = std::max(0.0, fit_b.slope - fit_nb.slope);
+    out.t_submit_cpu_us  = std::max(0.0, cpu_1 - gpu_1);
+    out.r2_dispatch      = 0.5 * (fit_nb.r2 + fit_b.r2);
 
     if (cfg_.verbose) {
-        std::cout << std::fixed << std::setprecision(3) << "[MB1 Dispatch] t_submit_cpu = " << out.t_submit_cpu_us
-                  << " us | t_launch_gpu = " << out.t_launch_gpu_us << " us | t_barrier_gpu = " << out.t_barrier_gpu_us
-                  << " us\n";
+        std::cout << std::fixed << std::setprecision(3) << "[MB1 Dispatch] t_submit = " << out.t_submit_cpu_us
+                  << " us | t_launch = " << out.t_launch_gpu_us << " us | t_barrier = " << out.t_barrier_gpu_us
+                  << " us (R2=" << out.r2_dispatch << ")\n";
     }
 
     backend_.destroy_kernel(krn);
@@ -114,10 +178,9 @@ void Calibrator::run_mb2_cache_hierarchy(DeviceProfile& out, BufferHandle shared
         if (w_bytes > max_bytes) {
             break;
         }
-
-        auto num_blocks       = static_cast<uint32_t>(w_bytes / 4096ull);
-        uint32_t passes       = std::max<uint32_t>(1u, num_blocks / kNumGroups);
-        uint32_t sweeps       = std::max<uint32_t>(1u, (64u + passes - 1u) / passes);
+        auto num_blocks = static_cast<uint32_t>(w_bytes / 4096ull);
+        uint32_t passes = std::max<uint32_t>(1u, num_blocks / kNumGroups);
+        uint32_t sweeps = std::max<uint32_t>(1u, (64u + passes - 1u) / passes);
         std::array<BufferHandle, 2> bufs{shared_src_buf, sink_buf};
 
         {
@@ -145,18 +208,11 @@ void Calibrator::run_mb2_cache_hierarchy(DeviceProfile& out, BufferHandle shared
         uint32_t iters =
             (w_bytes >= 64 * 1024 * 1024) ? std::max<uint32_t>(11u, cfg_.timed_iters / 2) : cfg_.timed_iters;
         for (uint32_t it = 0; it < iters; ++it) {
-            auto tr = backend_.execute(d);
-            gbps_samples.push_back(bytes_per_dispatch / tr.gpu_execution_ns);
+            gbps_samples.push_back(bytes_per_dispatch / backend_.execute(d).gpu_execution_ns);
         }
 
         auto st = calc_median_iqr(gbps_samples);
         out.bw_curve.push_back({w_bytes, st.median, st.iqr});
-
-        if (cfg_.verbose) {
-            double mb = static_cast<double>(w_bytes) / (1024.0 * 1024.0);
-            std::cout << "  [MB2] W = " << std::setw(7) << std::setprecision(2) << mb << " MB -> " << std::setw(8)
-                      << std::setprecision(2) << st.median << " GB/s (IQR " << std::setw(5) << st.iqr << ")\n";
-        }
     }
 
     const auto& c = out.bw_curve;
@@ -168,9 +224,8 @@ void Calibrator::run_mb2_cache_hierarchy(DeviceProfile& out, BufferHandle shared
         }
         int cliff_idx   = l2_top_idx;
         double max_drop = 0.0;
-        int search_lo   = std::max(1, l2_top_idx - 3);
-        int search_hi   = std::min<int>(static_cast<int>(c.size()) - 2, l2_top_idx + 2);
-        for (int idx = search_lo; idx <= search_hi; ++idx) {
+        for (int idx = std::max(1, l2_top_idx - 3); idx <= std::min<int>(static_cast<int>(c.size()) - 2, l2_top_idx + 2);
+             ++idx) {
             double drop = c[idx].bw_median_gbps - c[idx + 1].bw_median_gbps;
             if (drop > max_drop) {
                 max_drop  = drop;
@@ -182,7 +237,7 @@ void Calibrator::run_mb2_cache_hierarchy(DeviceProfile& out, BufferHandle shared
     }
 
     if (cfg_.verbose) {
-        std::cout << "[MB2 Summary] Detected L2 ~= "
+        std::cout << std::setprecision(2) << "[MB2 Memory]   L2 ~= "
                   << (static_cast<double>(out.l2_effective_bytes) / (1024.0 * 1024.0))
                   << " MB | BW_L2 = " << out.bw_l2_gbps << " GB/s | BW_DRAM = " << out.bw_dram_gbps << " GB/s\n";
     }
@@ -221,8 +276,7 @@ void Calibrator::run_mb3_stride(DeviceProfile& out, BufferHandle shared_src_buf,
             static_cast<double>(kTotalThreads) * static_cast<double>(passes) * static_cast<double>(sweeps) * 4.0;
         std::vector<double> samples;
         for (uint32_t it = 0; it < 15; ++it) {
-            auto tr = backend_.execute(d);
-            samples.push_back(useful_bytes / tr.gpu_execution_ns);
+            samples.push_back(useful_bytes / backend_.execute(d).gpu_execution_ns);
         }
         return calc_median_iqr(samples).median;
     };
@@ -244,23 +298,20 @@ void Calibrator::run_mb3_stride(DeviceProfile& out, BufferHandle shared_src_buf,
     out.coal_factor_dram_s32   = std::clamp(dram_s32 / std::max(1e-6, dram_s1), 0.005, 1.0);
 
     if (cfg_.verbose) {
-        std::cout << "[MB3 Stride=32] L2 useful BW = " << out.bw_l2_strided32_gbps << " GB/s (factor "
-                  << std::setprecision(3) << out.coal_factor_l2_s32
-                  << ") | DRAM useful BW = " << std::setprecision(2) << out.bw_dram_strided32_gbps
-                  << " GB/s (factor " << std::setprecision(3) << out.coal_factor_dram_s32 << ")\n";
+        std::cout << "[MB3 Stride]   L2 coal = " << std::setprecision(3) << out.coal_factor_l2_s32
+                  << " | DRAM coal = " << out.coal_factor_dram_s32 << "\n";
     }
 
     backend_.destroy_kernel(krn);
     backend_.free_buffer(sink_buf);
 }
 
-void Calibrator::run_mb4_smem_vs_cache(DeviceProfile& out, BufferHandle shared_src_buf) {
+void Calibrator::run_mb4_tiled_gemm(DeviceProfile& out, BufferHandle shared_src_buf) {
     constexpr uint32_t M = 1024, N = 1024, K = 512;
     BufferHandle buf_b    = backend_.allocate_buffer(K * N * sizeof(float));
     BufferHandle buf_bias = backend_.allocate_buffer(N * sizeof(float));
     BufferHandle buf_c    = backend_.allocate_buffer(M * N * sizeof(float));
 
-    // Initialize B and bias with PRNG so no NaN/denormal stalls occur
     {
         KernelHandle init_krn = backend_.compile_kernel(BenchKernelId::InitPrngVec4, 0);
         std::array<BufferHandle, 1> b1{buf_b};
@@ -273,35 +324,45 @@ void Calibrator::run_mb4_smem_vs_cache(DeviceProfile& out, BufferHandle shared_s
         backend_.destroy_kernel(init_krn);
     }
 
-    auto bench_variant = [&](BenchKernelId kid) {
+    auto bench_gemm = [&](BenchKernelId kid, uint32_t m_sz, uint32_t n_sz, uint32_t k_sz) {
         KernelHandle krn = backend_.compile_kernel(kid, 0);
         std::array<BufferHandle, 4> bufs{shared_src_buf, buf_b, buf_bias, buf_c};
-        std::array<Scalar32, 4> sc{Scalar32::U32(M), Scalar32::U32(N), Scalar32::U32(K), Scalar32::F32(-999999.0f)};
-        DispatchDesc d{krn, bufs, sc, {N / 64, M / 64, 1}, {16, 16, 1}, 1, false};
+        std::array<Scalar32, 4> sc{
+            Scalar32::U32(m_sz), Scalar32::U32(n_sz), Scalar32::U32(k_sz), Scalar32::F32(-999999.0f)};
+        uint32_t gm = (m_sz + 63u) / 64u;
+        uint32_t gn = (n_sz + 63u) / 64u;
+        DispatchDesc d{krn, bufs, sc, {gn, gm, 1}, {16, 16, 1}, 1, false};
 
         for (int w = 0; w < 4; ++w) {
             backend_.execute(d);
         }
-        double flops = 2.0 * static_cast<double>(M) * static_cast<double>(N) * static_cast<double>(K);
+        // Normalize by padded tile FLOPs so tail_efficiency isolates pure bounds-check predication overhead
+        double m_pad = static_cast<double>(gm * 64u);
+        double n_pad = static_cast<double>(gn * 64u);
+        double k_pad = static_cast<double>(((k_sz + 15u) / 16u) * 16u);
+        double flops = 2.0 * m_pad * n_pad * k_pad;
         std::vector<double> gflops;
         for (uint32_t it = 0; it < cfg_.timed_iters; ++it) {
-            auto tr = backend_.execute(d);
-            gflops.push_back(flops / tr.gpu_execution_ns);
+            gflops.push_back(flops / backend_.execute(d).gpu_execution_ns);
         }
         backend_.destroy_kernel(krn);
         return calc_median_iqr(gflops).median;
     };
 
-    out.gflops_matmul_smem    = bench_variant(BenchKernelId::MB4_MatmulSmem);
-    out.gflops_matmul_cache   = bench_variant(BenchKernelId::MB4_MatmulDirectCache);
+    out.gflops_matmul_smem    = bench_gemm(BenchKernelId::MB4_MatmulSmem, M, N, K);
+    out.gflops_matmul_cache   = bench_gemm(BenchKernelId::MB4_MatmulDirectCache, M, N, K);
+    double gflops_tail        = bench_gemm(BenchKernelId::MB4_MatmulSmemTail, 1000, 1000, 500);
+    double gflops_fused_erf   = bench_gemm(BenchKernelId::MB6_MatmulFusedGeluErf, M, N, K);
+
     out.smem_vs_cache_speedup = out.gflops_matmul_smem / std::max(1e-6, out.gflops_matmul_cache);
     out.prefer_shared_mem     = (out.smem_vs_cache_speedup > 1.05);
+    out.tail_efficiency       = std::clamp(gflops_tail / std::max(1e-6, out.gflops_matmul_smem), 0.25, 1.0);
+    out.fusion_reg_factor     = std::clamp(gflops_fused_erf / std::max(1e-6, out.gflops_matmul_smem), 0.20, 1.0);
 
     if (cfg_.verbose) {
-        std::cout << std::setprecision(2) << "[MB4 Tiled 64x64] SMEM = " << out.gflops_matmul_smem
-                  << " GFLOPS | DirectCache = " << out.gflops_matmul_cache
-                  << " GFLOPS | Speedup = " << std::setprecision(3) << out.smem_vs_cache_speedup << "x (prefer_smem="
-                  << (out.prefer_shared_mem ? "true" : "false") << ")\n";
+        std::cout << std::setprecision(2) << "[MB4 Tiled]    SMEM = " << out.gflops_matmul_smem
+                  << " | Cache = " << out.gflops_matmul_cache << " GFLOPS | tail_eff = " << std::setprecision(3)
+                  << out.tail_efficiency << " | fusion_reg = " << out.fusion_reg_factor << "\n";
     }
 
     backend_.free_buffer(buf_c);
@@ -319,7 +380,6 @@ void Calibrator::run_mb5_compute_and_waves(DeviceProfile& out) {
     KernelHandle krn_tanh = backend_.compile_kernel(BenchKernelId::MB5_GeluTanh, 0);
     KernelHandle krn_erf  = backend_.compile_kernel(BenchKernelId::MB5_GeluErf, 0);
 
-    // 5a. Peak FP32 FMA throughput
     {
         constexpr uint32_t kGroups = 256, kIters = 4096;
         std::array<Scalar32, 4> sc{
@@ -336,7 +396,6 @@ void Calibrator::run_mb5_compute_and_waves(DeviceProfile& out) {
         out.pi_fma_gflops = calc_median_iqr(samples).median;
     }
 
-    // 5b. GELU(TANH) and GELU(ERF) SFU throughput (Giga-elements/s)
     auto measure_sfu = [&](KernelHandle krn) {
         constexpr uint32_t kGroups = 256, kIters = 512;
         std::array<Scalar32, 4> sc{
@@ -355,7 +414,6 @@ void Calibrator::run_mb5_compute_and_waves(DeviceProfile& out) {
     out.pi_gelu_tanh_gelem_s = measure_sfu(krn_tanh);
     out.pi_gelu_erf_gelem_s  = measure_sfu(krn_erf);
 
-    // 5c. Wave saturation curve across workgroup counts G
     const std::vector<uint32_t> grid_sizes = {1,  2,  4,  6,   8,   12,  16,  24,  32,  36,
                                               48, 64, 72, 96, 108, 144, 192, 256, 384, 512};
     out.wave_curve.clear();
@@ -371,21 +429,23 @@ void Calibrator::run_mb5_compute_and_waves(DeviceProfile& out) {
         for (int it = 0; it < 9; ++it) {
             ns_vec.push_back(backend_.execute(d).gpu_execution_ns);
         }
-        double med_ns = calc_median_iqr(ns_vec).median;
-        double gf     = flops / med_ns;
+        double med_ns    = calc_median_iqr(ns_vec).median;
+        double gf        = flops / med_ns;
         peak_wave_gflops = std::max(peak_wave_gflops, gf);
         out.wave_curve.push_back({g, gf, med_ns * 1e-3});
     }
+    out.pi_fma_gflops = std::max(out.pi_fma_gflops, peak_wave_gflops);
 
-    // Detect hardware wave quantum from the first discrete step jump (>1.35x) in GPU execution time
-    out.g_wave_quantum = grid_sizes.front();
+    out.g_wave_quantum  = grid_sizes.front();
+    out.pi_wave1_gflops = out.wave_curve.front().gflops;
     if (out.wave_curve.size() >= 2) {
         double base_us = out.wave_curve.front().gpu_time_us;
         for (size_t i = 0; i + 1 < out.wave_curve.size(); ++i) {
             double curr_us = out.wave_curve[i].gpu_time_us;
             double next_us = out.wave_curve[i + 1].gpu_time_us;
             if (next_us > 1.35 * curr_us && next_us > 1.35 * base_us) {
-                out.g_wave_quantum = out.wave_curve[i].workgroups;
+                out.g_wave_quantum  = out.wave_curve[i].workgroups;
+                out.pi_wave1_gflops = out.wave_curve[i].gflops;
                 break;
             }
         }
@@ -407,9 +467,9 @@ void Calibrator::run_mb5_compute_and_waves(DeviceProfile& out) {
     }
 
     if (cfg_.verbose) {
-        std::cout << std::setprecision(2) << "[MB5 Compute] Peak FMA = " << out.pi_fma_gflops
-                  << " GFLOPS | GELU_TANH = " << out.pi_gelu_tanh_gelem_s
-                  << " GElem/s | GELU_ERF = " << out.pi_gelu_erf_gelem_s << " GElem/s | G_wave = " << out.g_wave_quantum << " WGs, G_half = " << out.g_half_workgroups << " WGs, G_sat(85%) = " << out.g_sat_workgroups << " WGs\n";
+        std::cout << std::setprecision(2) << "[MB5 Compute]  Peak FMA = " << out.pi_fma_gflops
+                  << " | GELU_ERF = " << out.pi_gelu_erf_gelem_s << " GElem/s | G_wave = " << out.g_wave_quantum
+                  << " (pi_wave1 = " << out.pi_wave1_gflops << " GFLOPS)\n";
     }
 
     backend_.destroy_kernel(krn_erf);
@@ -418,7 +478,7 @@ void Calibrator::run_mb5_compute_and_waves(DeviceProfile& out) {
     backend_.free_buffer(sink_buf);
 }
 
-void Calibrator::run_mb6_compile_cost(DeviceProfile& out, BufferHandle shared_src_buf) {
+void Calibrator::run_mb6_compile_ols(DeviceProfile& out, BufferHandle shared_src_buf) {
     BufferHandle buf_b    = backend_.allocate_buffer(64 * 64 * sizeof(float));
     BufferHandle buf_bias = backend_.allocate_buffer(64 * sizeof(float));
     BufferHandle buf_c    = backend_.allocate_buffer(64 * 64 * sizeof(float));
@@ -426,18 +486,47 @@ void Calibrator::run_mb6_compile_cost(DeviceProfile& out, BufferHandle shared_sr
     std::random_device rd;
     std::mt19937 rng(rd());
 
-    auto measure_compile = [&](BenchKernelId kid, bool is_matmul) {
-        std::vector<double> cpu_ms, lazy_ms;
+    enum class ProbeMode { Noop, Compute1D, Matmul4Buf };
+    struct ProbeSpec {
+        BenchKernelId id;
+        ProbeMode     mode;
+    };
+    const std::vector<ProbeSpec> probes = {
+        {BenchKernelId::MB1_DispatchNoop, ProbeMode::Noop},
+        {BenchKernelId::MB5_GeluTanh, ProbeMode::Compute1D},
+        {BenchKernelId::MB5_GeluErf, ProbeMode::Compute1D},
+        {BenchKernelId::MB4_MatmulDirectCache, ProbeMode::Matmul4Buf},
+        {BenchKernelId::MB4_MatmulSmem, ProbeMode::Matmul4Buf},
+        {BenchKernelId::MB6_MatmulFusedGeluErf, ProbeMode::Matmul4Buf},
+    };
+
+    std::vector<double> drv_xs, drv_ys, fe_xs, fe_ys;
+    out.mb6_drv_points.clear();
+    out.mb6_fe_points.clear();
+    double drv_wall_ms = 0.0, fe_wall_ms = 0.0;
+
+    for (const auto& ps : probes) {
+        auto t_drv0      = std::chrono::steady_clock::now();
+        double spv_words = static_cast<double>(backend_.get_kernel_spirv_words(ps.id));
+        std::vector<double> total_drv_samples;
+
         for (uint32_t s = 0; s < cfg_.compile_samples; ++s) {
-            uint32_t salt = ((rng() & 0x007FFFFEu) | 1u);
-            double comp_ns = 0.0;
-            KernelHandle krn = backend_.compile_kernel(kid, salt, &comp_ns);
+            uint32_t salt    = ((rng() & 0x007FFFFEu) | 1u);
+            double comp_ns   = 0.0;
+            KernelHandle krn = backend_.compile_kernel(ps.id, salt, &comp_ns);
 
             TimingResult tr1{}, tr2{};
-            if (!is_matmul) {
+            if (ps.mode == ProbeMode::Noop) {
                 std::array<BufferHandle, 1> b1{buf_c};
                 std::array<Scalar32, 2> sc{Scalar32::U32(1), Scalar32::F32(-999999.0f)};
                 DispatchDesc d{krn, b1, sc, {1, 1, 1}, {64, 1, 1}, 1, false};
+                tr1 = backend_.execute(d);
+                tr2 = backend_.execute(d);
+            } else if (ps.mode == ProbeMode::Compute1D) {
+                std::array<BufferHandle, 1> b1{buf_c};
+                std::array<Scalar32, 4> sc{
+                    Scalar32::U32(1), Scalar32::F32(0.5f), Scalar32::F32(0.3f), Scalar32::F32(-999999.0f)};
+                DispatchDesc d{krn, b1, sc, {1, 1, 1}, {256, 1, 1}, 1, false};
                 tr1 = backend_.execute(d);
                 tr2 = backend_.execute(d);
             } else {
@@ -449,26 +538,70 @@ void Calibrator::run_mb6_compile_cost(DeviceProfile& out, BufferHandle shared_sr
                 tr2 = backend_.execute(d);
             }
 
-            cpu_ms.push_back(comp_ns * 1e-6);
-            lazy_ms.push_back(std::max(0.0, (tr1.cpu_wall_ns - tr2.cpu_wall_ns) * 1e-6));
+            double lazy_ms = std::max(0.0, (tr1.cpu_wall_ns - tr2.cpu_wall_ns) * 1e-6);
+            total_drv_samples.push_back(comp_ns * 1e-6 + lazy_ms);
             backend_.destroy_kernel(krn);
         }
-        return std::pair{calc_median_iqr(cpu_ms).median, calc_median_iqr(lazy_ms).median};
-    };
 
-    std::tie(out.t_compile_small_cpu_ms, out.t_compile_small_lazy_ms) =
-        measure_compile(BenchKernelId::MB1_DispatchNoop, false);
-    std::tie(out.t_compile_tiled_cpu_ms, out.t_compile_tiled_lazy_ms) =
-        measure_compile(BenchKernelId::MB4_MatmulSmem, true);
-    std::tie(out.t_compile_fused_erf_cpu_ms, out.t_compile_fused_erf_lazy_ms) =
-        measure_compile(BenchKernelId::MB6_MatmulFusedGeluErf, true);
+        double med_drv = calc_median_iqr(total_drv_samples).median;
+        drv_xs.push_back(spv_words);
+        drv_ys.push_back(med_drv);
+        out.mb6_drv_points.push_back({static_cast<uint32_t>(spv_words), med_drv});
+        drv_wall_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_drv0).count();
+
+        if (fe_probe_ && fe_probe_->is_available()) {
+            auto t_fe0 = std::chrono::steady_clock::now();
+            std::vector<double> fe_samples;
+            size_t measured_words = 0;
+            uint32_t fe_runs      = std::min<uint32_t>(cfg_.compile_samples, 3u);
+            for (uint32_t s = 0; s < fe_runs; ++s) {
+                uint32_t salt = ((rng() & 0x007FFFFEu) | 1u);
+                double fe_ms  = 0.0;
+                if (fe_probe_->measure_compile_ms(ps.id, salt, &fe_ms, &measured_words)) {
+                    fe_samples.push_back(fe_ms);
+                }
+            }
+            if (!fe_samples.empty()) {
+                double w_fe   = measured_words > 0 ? static_cast<double>(measured_words) : spv_words;
+                double med_fe = calc_median_iqr(fe_samples).median;
+                fe_xs.push_back(w_fe);
+                fe_ys.push_back(med_fe);
+                out.mb6_fe_points.push_back({static_cast<uint32_t>(w_fe), med_fe});
+            }
+            fe_wall_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_fe0).count();
+        }
+    }
+
+    auto drv_fit                 = fit_ols_1d(drv_xs, drv_ys, true);
+    out.beta_0_drv_ms            = drv_fit.intercept;
+    out.beta_1_drv_ms_per_word   = drv_fit.slope;
+    out.r2_drv                   = drv_fit.r2;
+    out.t_cache_hit_ms           = backend_.measure_pipeline_cache_hit_ms(BenchKernelId::MB4_MatmulSmem);
+    out.stage_timings.mb6_drv_ms = drv_wall_ms;
+    out.stage_timings.mb6_fe_ms  = fe_wall_ms;
+
+    if (fe_xs.size() >= 2 && fe_probe_) {
+        auto fe_fit = fit_ols_1d(fe_xs, fe_ys, true);
+        if (fe_probe_->kind() == CompilerKind::Slang) {
+            out.alpha_0_slang_ms          = fe_fit.intercept;
+            out.alpha_1_slang_ms_per_word = fe_fit.slope;
+            out.r2_fe_slang               = fe_fit.r2;
+        } else if (fe_probe_->kind() == CompilerKind::GraphCompiler) {
+            out.alpha_0_gc_ms          = fe_fit.intercept;
+            out.alpha_1_gc_ms_per_word = fe_fit.slope;
+            out.r2_fe_gc               = fe_fit.r2;
+        }
+    }
 
     if (cfg_.verbose) {
-        std::cout << std::setprecision(3)
-                  << "[MB6 Compile (CPU + Lazy ms)] Small = " << out.t_compile_small_cpu_ms << " + "
-                  << out.t_compile_small_lazy_ms << " ms | TiledMatMul = " << out.t_compile_tiled_cpu_ms << " + "
-                  << out.t_compile_tiled_lazy_ms << " ms | FusedMatMulGeluErf = " << out.t_compile_fused_erf_cpu_ms
-                  << " + " << out.t_compile_fused_erf_lazy_ms << " ms\n";
+        std::cout << std::setprecision(4) << "[MB6 Compile]  Drv OLS: b0 = " << out.beta_0_drv_ms
+                  << " ms, b1 = " << (out.beta_1_drv_ms_per_word * 1e3) << " us/word (R2=" << out.r2_drv
+                  << ") | cache_hit = " << out.t_cache_hit_ms << " ms\n";
+        if (out.r2_fe_slang > 0.0) {
+            std::cout << "               Slang FE OLS: a0 = " << out.alpha_0_slang_ms
+                      << " ms, a1 = " << (out.alpha_1_slang_ms_per_word * 1e3) << " us/word (R2=" << out.r2_fe_slang
+                      << ")\n";
+        }
     }
 
     backend_.free_buffer(buf_c);
@@ -477,15 +610,21 @@ void Calibrator::run_mb6_compile_cost(DeviceProfile& out, BufferHandle shared_sr
 }
 
 DeviceProfile Calibrator::run_full() {
+    auto cal_t0 = std::chrono::steady_clock::now();
+    auto ms_since = [](auto t0) {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    };
+
     DeviceProfile prof{};
-    prof.props = backend_.query_static_props();
+    prof.schema_version = kDeviceProfileSchemaVersion;
+    prof.props          = backend_.query_static_props();
+
     if (cfg_.verbose) {
         std::cout << "============================================================\n"
                   << "Device   : " << prof.props.device_name << " (" << prof.props.driver_name << ")\n"
-                  << "Topology : " << (prof.props.is_integrated_uma ? "Integrated UMA" : "Discrete GPU")
-                  << " | Subgroup: " << prof.props.subgroup_size << " [" << prof.props.min_subgroup_size << ".."
-                  << prof.props.max_subgroup_size
-                  << "] | SharedMem limit: " << (prof.props.max_shared_mem_bytes / 1024) << " KB\n"
+                  << "Topology : " << (prof.props.is_integrated_uma ? "Unified UMA" : "Desktop Discrete")
+                  << " | Subgroup: " << prof.props.subgroup_size
+                  << " | SharedMem: " << (prof.props.max_shared_mem_bytes / 1024) << " KB\n"
                   << "============================================================\n";
     }
 
@@ -498,6 +637,7 @@ DeviceProfile Calibrator::run_full() {
     }
     max_bytes = std::max<size_t>(64ull * 1024 * 1024, (max_bytes / (16 * 1024 * 1024)) * (16 * 1024 * 1024));
 
+    auto ts = std::chrono::steady_clock::now();
     BufferHandle shared_src_buf = backend_.allocate_buffer(max_bytes);
     {
         KernelHandle init_krn = backend_.compile_kernel(BenchKernelId::InitPrngVec4, 0);
@@ -507,40 +647,67 @@ DeviceProfile Calibrator::run_full() {
         backend_.execute({init_krn, ibufs, iscalars, {128, 1, 1}, {256, 1, 1}, 1, false});
         backend_.destroy_kernel(init_krn);
     }
+    prof.stage_timings.init_prng_ms = ms_since(ts);
 
-    run_warmup();
-    run_mb1_dispatch(prof);
-    run_mb2_cache_hierarchy(prof, shared_src_buf, max_bytes);
-    run_mb3_stride(prof, shared_src_buf, max_bytes);
-    run_mb4_smem_vs_cache(prof, shared_src_buf);
-    run_mb5_compute_and_waves(prof);
-    run_mb6_compile_cost(prof, shared_src_buf);
+    ts = std::chrono::steady_clock::now(); run_warmup();                                             prof.stage_timings.mb0_warmup_ms   = ms_since(ts);
+    ts = std::chrono::steady_clock::now(); run_mb1_dispatch(prof);                                   prof.stage_timings.mb1_dispatch_ms = ms_since(ts);
+    ts = std::chrono::steady_clock::now(); run_mb2_cache_hierarchy(prof, shared_src_buf, max_bytes); prof.stage_timings.mb2_cache_ms    = ms_since(ts);
+    ts = std::chrono::steady_clock::now(); run_mb3_stride(prof, shared_src_buf, max_bytes);          prof.stage_timings.mb3_stride_ms   = ms_since(ts);
+    ts = std::chrono::steady_clock::now(); run_mb4_tiled_gemm(prof, shared_src_buf);                 prof.stage_timings.mb4_tiled_ms    = ms_since(ts);
+    ts = std::chrono::steady_clock::now(); run_mb5_compute_and_waves(prof);                          prof.stage_timings.mb5_compute_ms  = ms_since(ts);
+    run_mb6_compile_ols(prof, shared_src_buf);
 
     backend_.free_buffer(shared_src_buf);
+    prof.calibration_wall_time_ms = ms_since(cal_t0);
+    if (cfg_.verbose) {
+        const auto& st = prof.stage_timings;
+        std::cout << std::fixed << std::setprecision(1)
+                  << "[Bench Times]  Init=" << st.init_prng_ms << " | MB0=" << st.mb0_warmup_ms
+                  << " | MB1=" << st.mb1_dispatch_ms << " | MB2=" << st.mb2_cache_ms
+                  << " | MB3=" << st.mb3_stride_ms << " | MB4=" << st.mb4_tiled_ms
+                  << " | MB5=" << st.mb5_compute_ms << " | MB6_drv=" << st.mb6_drv_ms
+                  << " | MB6_fe=" << st.mb6_fe_ms << " ms (Total=" << prof.calibration_wall_time_ms << " ms)\n";
+    }
     return prof;
 }
 
 std::string Calibrator::to_json_string(const DeviceProfile& p) {
     nlohmann::ordered_json j;
-    j["runtime"] = to_string(p.props.runtime);
-    j["device"]  = {{"name", p.props.device_name},
-                    {"driver", p.props.driver_name},
-                    {"vendor_id", p.props.vendor_id},
-                    {"device_id", p.props.device_id},
-                    {"device_uuid", p.props.device_uuid_hex},
-                    {"driver_uuid", p.props.driver_uuid_hex},
-                    {"is_integrated_uma", p.props.is_integrated_uma},
-                    {"subgroup_size", p.props.subgroup_size},
-                    {"max_wg_invocations", p.props.max_wg_invocations},
-                    {"max_shared_mem_bytes", p.props.max_shared_mem_bytes},
-                    {"device_local_mem_mb", p.props.device_local_mem_bytes / (1024 * 1024)}};
-    j["mb1_dispatch"] = {{"t_submit_cpu_us", p.t_submit_cpu_us},
-                         {"t_launch_gpu_us", p.t_launch_gpu_us},
-                         {"t_barrier_gpu_us", p.t_barrier_gpu_us}};
-    j["mb2_memory"]   = {{"l2_effective_bytes", p.l2_effective_bytes},
-                         {"l2_effective_mb", static_cast<double>(p.l2_effective_bytes) / (1024.0 * 1024.0)},
-                         {"bw_l2_gbps", p.bw_l2_gbps},
-                         {"bw_dram_gbps", p.bw_dram_gbps}};
+    j["schema_version"]           = p.schema_version;
+    j["calibration_wall_time_ms"] = p.calibration_wall_time_ms;
+    j["stage_timings_ms"]         = {{"init_prng_ms", p.stage_timings.init_prng_ms},
+                                     {"mb0_warmup_ms", p.stage_timings.mb0_warmup_ms},
+                                     {"mb1_dispatch_ms", p.stage_timings.mb1_dispatch_ms},
+                                     {"mb2_cache_ms", p.stage_timings.mb2_cache_ms},
+                                     {"mb3_stride_ms", p.stage_timings.mb3_stride_ms},
+                                     {"mb4_tiled_ms", p.stage_timings.mb4_tiled_ms},
+                                     {"mb5_compute_ms", p.stage_timings.mb5_compute_ms},
+                                     {"mb6_drv_ms", p.stage_timings.mb6_drv_ms},
+                                     {"mb6_fe_ms", p.stage_timings.mb6_fe_ms}};
+    j["runtime"]                  = to_string(p.props.runtime);
+    j["device"]                   = {{"name", p.props.device_name},
+                                     {"driver", p.props.driver_name},
+                                     {"api_version", p.props.api_version_str},
+                                     {"vendor_id", p.props.vendor_id},
+                                     {"device_id", p.props.device_id},
+                                     {"device_uuid", p.props.device_uuid_hex},
+                                     {"driver_uuid", p.props.driver_uuid_hex},
+                                     {"is_integrated_uma", p.props.is_integrated_uma},
+                                     {"subgroup_size", p.props.subgroup_size},
+                                     {"max_wg_invocations", p.props.max_wg_invocations},
+                                     {"max_shared_mem_bytes", p.props.max_shared_mem_bytes},
+                                     {"device_local_mem_mb", p.props.device_local_mem_bytes / (1024 * 1024)}};
+    j["mb1_dispatch"]             = {{"t_submit_cpu_us", p.t_submit_cpu_us},
+                                     {"t_launch_gpu_us", p.t_launch_gpu_us},
+                                     {"t_barrier_gpu_us", p.t_barrier_gpu_us},
+                                     {"r2_dispatch", p.r2_dispatch}};
+    nlohmann::json bw_arr         = nlohmann::json::array();
+    for (const auto& pt : p.bw_curve) bw_arr.push_back({pt.working_set_bytes, pt.bw_median_gbps, pt.bw_iqr_gbps});
+    j["mb2_memory"]     = {{"l2_effective_bytes", p.l2_effective_bytes},
+                           {"l2_effective_mb", static_cast<double>(p.l2_effective_bytes) / (1024.0 * 1024.0)},
+                           {"bw_l2_gbps", p.bw_l2_gbps},
+                           {"bw_dram_gbps", p.bw_dram_gbps},
+                           {"bw_curve", bw_arr}};
     j["mb3_coalescing"] = {{"bw_l2_strided32_gbps", p.bw_l2_strided32_gbps},
                            {"coal_factor_l2_s32", p.coal_factor_l2_s32},
                            {"bw_dram_strided32_gbps", p.bw_dram_strided32_gbps},
@@ -548,20 +715,111 @@ std::string Calibrator::to_json_string(const DeviceProfile& p) {
     j["mb4_tiling"]     = {{"gflops_matmul_smem", p.gflops_matmul_smem},
                            {"gflops_matmul_cache", p.gflops_matmul_cache},
                            {"smem_vs_cache_speedup", p.smem_vs_cache_speedup},
-                           {"prefer_shared_mem", p.prefer_shared_mem}};
+                           {"prefer_shared_mem", p.prefer_shared_mem},
+                           {"tail_efficiency", p.tail_efficiency},
+                           {"fusion_reg_factor", p.fusion_reg_factor}};
     j["mb5_compute"]    = {{"pi_fma_gflops", p.pi_fma_gflops},
-                           {"pi_gelu_tanh_gelem_s", p.pi_gelu_tanh_gelem_s},
                            {"pi_gelu_erf_gelem_s", p.pi_gelu_erf_gelem_s},
+                           {"pi_gelu_tanh_gelem_s", p.pi_gelu_tanh_gelem_s},
                            {"g_wave_quantum", p.g_wave_quantum},
+                           {"pi_wave1_gflops", p.pi_wave1_gflops},
                            {"g_half_workgroups", p.g_half_workgroups},
                            {"g_sat_workgroups", p.g_sat_workgroups}};
-    j["mb6_compile"]    = {{"small_cpu_ms", p.t_compile_small_cpu_ms},
-                           {"small_lazy_ms", p.t_compile_small_lazy_ms},
-                           {"tiled_matmul_cpu_ms", p.t_compile_tiled_cpu_ms},
-                           {"tiled_matmul_lazy_ms", p.t_compile_tiled_lazy_ms},
-                           {"fused_matmul_gelu_erf_cpu_ms", p.t_compile_fused_erf_cpu_ms},
-                           {"fused_matmul_gelu_erf_lazy_ms", p.t_compile_fused_erf_lazy_ms}};
+    nlohmann::json drv_pts = nlohmann::json::array();
+    for (const auto& pt : p.mb6_drv_points) drv_pts.push_back({pt.spirv_words, pt.time_ms});
+    nlohmann::json fe_pts = nlohmann::json::array();
+    for (const auto& pt : p.mb6_fe_points) fe_pts.push_back({pt.spirv_words, pt.time_ms});
+    j["mb6_compile"]    = {{"alpha_0_slang_ms", p.alpha_0_slang_ms},
+                           {"alpha_1_slang_ms_per_word", p.alpha_1_slang_ms_per_word},
+                           {"alpha_0_gc_ms", p.alpha_0_gc_ms},
+                           {"alpha_1_gc_ms_per_word", p.alpha_1_gc_ms_per_word},
+                           {"beta_0_drv_ms", p.beta_0_drv_ms},
+                           {"beta_1_drv_ms_per_word", p.beta_1_drv_ms_per_word},
+                           {"t_cache_hit_ms", p.t_cache_hit_ms},
+                           {"r2_fe_slang", p.r2_fe_slang},
+                           {"r2_fe_gc", p.r2_fe_gc},
+                           {"r2_drv", p.r2_drv},
+                           {"drv_points", drv_pts},
+                           {"fe_points", fe_pts}};
     return j.dump(2);
+}
+
+DeviceProfile Calibrator::from_json_string(const std::string& json_text) {
+    auto j                     = nlohmann::json::parse(json_text);
+    DeviceProfile p{};
+    p.schema_version           = j.value("schema_version", 1u);
+    p.calibration_wall_time_ms = j.value("calibration_wall_time_ms", 0.0);
+    std::string rt             = j.value("runtime", "vulkan");
+    p.props.runtime =
+        (rt == "opencl") ? RuntimeKind::OpenCL : (rt == "level_zero" ? RuntimeKind::LevelZero : RuntimeKind::Vulkan);
+
+    const auto& jd               = j.at("device");
+    p.props.device_name          = jd.value("name", "");
+    p.props.driver_name          = jd.value("driver", "");
+    p.props.api_version_str      = jd.value("api_version", "");
+    p.props.vendor_id            = jd.value("vendor_id", 0u);
+    p.props.device_id            = jd.value("device_id", 0u);
+    p.props.device_uuid_hex      = jd.value("device_uuid", "");
+    p.props.driver_uuid_hex      = jd.value("driver_uuid", "");
+    p.props.is_integrated_uma    = jd.value("is_integrated_uma", false);
+    p.props.subgroup_size        = jd.value("subgroup_size", 32u);
+    p.props.max_wg_invocations   = jd.value("max_wg_invocations", 256u);
+    p.props.max_shared_mem_bytes = jd.value("max_shared_mem_bytes", 32768u);
+
+    const auto& j1     = j.at("mb1_dispatch");
+    p.t_submit_cpu_us  = j1.value("t_submit_cpu_us", 0.0);
+    p.t_launch_gpu_us  = j1.value("t_launch_gpu_us", 0.0);
+    p.t_barrier_gpu_us = j1.value("t_barrier_gpu_us", 0.0);
+    p.r2_dispatch      = j1.value("r2_dispatch", 1.0);
+
+    const auto& j2       = j.at("mb2_memory");
+    p.l2_effective_bytes = j2.value("l2_effective_bytes", size_t{0});
+    p.bw_l2_gbps         = j2.value("bw_l2_gbps", 100.0);
+    p.bw_dram_gbps       = j2.value("bw_dram_gbps", 50.0);
+    if (j2.contains("bw_curve") && j2["bw_curve"].is_array()) {
+        for (const auto& row : j2["bw_curve"]) {
+            if (row.size() >= 2) {
+                p.bw_curve.push_back({row[0].get<size_t>(), row[1].get<double>(),
+                                      row.size() >= 3 ? row[2].get<double>() : 0.0});
+            }
+        }
+    }
+
+    const auto& j3           = j.at("mb3_coalescing");
+    p.bw_l2_strided32_gbps   = j3.value("bw_l2_strided32_gbps", 10.0);
+    p.coal_factor_l2_s32     = j3.value("coal_factor_l2_s32", 0.1);
+    p.bw_dram_strided32_gbps = j3.value("bw_dram_strided32_gbps", 5.0);
+    p.coal_factor_dram_s32   = j3.value("coal_factor_dram_s32", 0.1);
+
+    const auto& j4          = j.at("mb4_tiling");
+    p.gflops_matmul_smem    = j4.value("gflops_matmul_smem", 1000.0);
+    p.gflops_matmul_cache   = j4.value("gflops_matmul_cache", 1000.0);
+    p.smem_vs_cache_speedup = j4.value("smem_vs_cache_speedup", 1.0);
+    p.prefer_shared_mem     = j4.value("prefer_shared_mem", true);
+    p.tail_efficiency       = j4.value("tail_efficiency", 1.0);
+    p.fusion_reg_factor     = j4.value("fusion_reg_factor", 1.0);
+
+    const auto& j5          = j.at("mb5_compute");
+    p.pi_fma_gflops         = j5.value("pi_fma_gflops", 1000.0);
+    p.pi_gelu_erf_gelem_s   = j5.value("pi_gelu_erf_gelem_s", 100.0);
+    p.pi_gelu_tanh_gelem_s  = j5.value("pi_gelu_tanh_gelem_s", 100.0);
+    p.g_wave_quantum        = j5.value("g_wave_quantum", j5.value("g_half_workgroups", 1u));
+    p.pi_wave1_gflops       = j5.value("pi_wave1_gflops", p.pi_fma_gflops);
+    p.g_half_workgroups     = j5.value("g_half_workgroups", 1u);
+    p.g_sat_workgroups      = j5.value("g_sat_workgroups", 1u);
+
+    const auto& j6              = j.at("mb6_compile");
+    p.alpha_0_slang_ms          = j6.value("alpha_0_slang_ms", 0.0);
+    p.alpha_1_slang_ms_per_word = j6.value("alpha_1_slang_ms_per_word", 0.0);
+    p.alpha_0_gc_ms             = j6.value("alpha_0_gc_ms", 0.0);
+    p.alpha_1_gc_ms_per_word    = j6.value("alpha_1_gc_ms_per_word", 0.0);
+    p.beta_0_drv_ms             = j6.value("beta_0_drv_ms", 0.0);
+    p.beta_1_drv_ms_per_word    = j6.value("beta_1_drv_ms_per_word", 0.0);
+    p.t_cache_hit_ms            = j6.value("t_cache_hit_ms", 0.0);
+    p.r2_fe_slang               = j6.value("r2_fe_slang", 0.0);
+    p.r2_fe_gc                  = j6.value("r2_fe_gc", 0.0);
+    p.r2_drv                    = j6.value("r2_drv", 0.0);
+    return p;
 }
 
 void Calibrator::save_bw_csv(const DeviceProfile& p, const std::string& csv_path) {
@@ -579,65 +837,6 @@ void Calibrator::save_wave_csv(const DeviceProfile& p, const std::string& csv_pa
     for (const auto& pt : p.wave_curve) {
         ofs << pt.workgroups << "," << pt.gflops << "," << pt.gpu_time_us << "\n";
     }
-}
-
-
-DeviceProfile Calibrator::from_json_string(const std::string& json_text) {
-    auto j = nlohmann::json::parse(json_text);
-    DeviceProfile p{};
-    std::string rt = j.value("runtime", "vulkan");
-    p.props.runtime = (rt == "opencl") ? RuntimeKind::OpenCL : (rt == "level_zero" ? RuntimeKind::LevelZero : RuntimeKind::Vulkan);
-
-    const auto& jd               = j.at("device");
-    p.props.device_name          = jd.value("name", "");
-    p.props.driver_name          = jd.value("driver", "");
-    p.props.vendor_id            = jd.value("vendor_id", 0u);
-    p.props.device_id            = jd.value("device_id", 0u);
-    p.props.device_uuid_hex      = jd.value("device_uuid", "");
-    p.props.driver_uuid_hex      = jd.value("driver_uuid", "");
-    p.props.is_integrated_uma    = jd.value("is_integrated_uma", false);
-    p.props.subgroup_size        = jd.value("subgroup_size", 32u);
-    p.props.max_wg_invocations   = jd.value("max_wg_invocations", 256u);
-    p.props.max_shared_mem_bytes = jd.value("max_shared_mem_bytes", 32768u);
-
-    const auto& j1     = j.at("mb1_dispatch");
-    p.t_submit_cpu_us  = j1.value("t_submit_cpu_us", 0.0);
-    p.t_launch_gpu_us  = j1.value("t_launch_gpu_us", 0.0);
-    p.t_barrier_gpu_us = j1.value("t_barrier_gpu_us", 0.0);
-
-    const auto& j2       = j.at("mb2_memory");
-    p.l2_effective_bytes = j2.value("l2_effective_bytes", size_t{0});
-    p.bw_l2_gbps         = j2.value("bw_l2_gbps", 100.0);
-    p.bw_dram_gbps       = j2.value("bw_dram_gbps", 50.0);
-
-    const auto& j3           = j.at("mb3_coalescing");
-    p.bw_l2_strided32_gbps   = j3.value("bw_l2_strided32_gbps", 10.0);
-    p.coal_factor_l2_s32     = j3.value("coal_factor_l2_s32", 0.1);
-    p.bw_dram_strided32_gbps = j3.value("bw_dram_strided32_gbps", 5.0);
-    p.coal_factor_dram_s32   = j3.value("coal_factor_dram_s32", 0.1);
-
-    const auto& j4          = j.at("mb4_tiling");
-    p.gflops_matmul_smem    = j4.value("gflops_matmul_smem", 1000.0);
-    p.gflops_matmul_cache   = j4.value("gflops_matmul_cache", 1000.0);
-    p.smem_vs_cache_speedup = j4.value("smem_vs_cache_speedup", 1.0);
-    p.prefer_shared_mem     = j4.value("prefer_shared_mem", true);
-
-    const auto& j5          = j.at("mb5_compute");
-    p.pi_fma_gflops         = j5.value("pi_fma_gflops", 1000.0);
-    p.pi_gelu_tanh_gelem_s  = j5.value("pi_gelu_tanh_gelem_s", 100.0);
-    p.pi_gelu_erf_gelem_s   = j5.value("pi_gelu_erf_gelem_s", 100.0);
-    p.g_wave_quantum        = j5.value("g_wave_quantum", j5.value("g_half_workgroups", 1u));
-    p.g_half_workgroups     = j5.value("g_half_workgroups", 1u);
-    p.g_sat_workgroups      = j5.value("g_sat_workgroups", 1u);
-
-    const auto& j6               = j.at("mb6_compile");
-    p.t_compile_small_cpu_ms     = j6.value("small_cpu_ms", 0.0);
-    p.t_compile_small_lazy_ms    = j6.value("small_lazy_ms", 0.0);
-    p.t_compile_tiled_cpu_ms     = j6.value("tiled_matmul_cpu_ms", 0.0);
-    p.t_compile_tiled_lazy_ms    = j6.value("tiled_matmul_lazy_ms", 0.0);
-    p.t_compile_fused_erf_cpu_ms = j6.value("fused_matmul_gelu_erf_cpu_ms", 0.0);
-    p.t_compile_fused_erf_lazy_ms = j6.value("fused_matmul_gelu_erf_lazy_ms", 0.0);
-    return p;
 }
 
 } // namespace mgcm
