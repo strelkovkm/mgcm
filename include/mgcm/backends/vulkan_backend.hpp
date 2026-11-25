@@ -34,6 +34,8 @@ public:
 
     BufferHandle allocate_buffer(size_t size_bytes) override;
     void         free_buffer(BufferHandle buf) override;
+    void         upload_buffer(BufferHandle buf, const void* src, size_t bytes) override;
+    void         download_buffer(BufferHandle buf, void* dst, size_t bytes) override;
 
     size_t       get_kernel_spirv_words(BenchKernelId id) const override;
     KernelHandle compile_kernel(BenchKernelId id, uint32_t salt, double* out_cpu_compile_ns = nullptr) override;

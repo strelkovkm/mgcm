@@ -21,6 +21,11 @@ double median_of(std::vector<double> v) {
     std::sort(v.begin(), v.end());
     return v[v.size() / 2];
 }
+double iqr_of(std::vector<double> v) {
+    if (v.size() < 4) return 0.0;
+    std::sort(v.begin(), v.end());
+    return v[(v.size() * 3) / 4] - v[v.size() / 4];
+}
 
 } // namespace
 
@@ -149,7 +154,7 @@ int main(int argc, char** argv) {
 
         std::ofstream ofs(out_csv);
         ofs << "M,N,K,plan_id,plan_name,pred_compile_us,real_compile_us,pred_exec_us,real_exec_us,"
-               "pred_nomem_exec_us,pred_nodisp_exec_us\n";
+               "pred_nomem_exec_us,pred_nodisp_exec_us,real_exec_iqr_us\n";
 
         const double real_comp_p[4] = {
             real_krn_compile_us(k_mm_only, true) + real_krn_compile_us(k_el_add, true) +
@@ -224,8 +229,7 @@ int main(int argc, char** argv) {
 
                 ofs << M << "," << N << "," << K << "," << p << "," << mgcm::to_string(pred_full[p].plan) << ","
                     << pred_full[p].t_compile_us << "," << real_comp_p[p] << "," << pred_full[p].t_execute_us << ","
-                    << real_exec_p[p] << "," << pred_nomem[p].t_execute_us << "," << pred_nodisp[p].t_execute_us
-                    << "\n";
+                    << real_exec_p[p] << "," << pred_nomem[p].t_execute_us << "," << pred_nodisp[p].t_execute_us << "," << iqr_of(us) << "\n";
             }
 
             std::cout << "[M=" << std::setw(4) << M << "] " << std::fixed << std::setprecision(1)

@@ -108,6 +108,8 @@ public:
 
     virtual BufferHandle allocate_buffer(size_t size_bytes) = 0;
     virtual void         free_buffer(BufferHandle buf) = 0;
+    virtual void         upload_buffer(BufferHandle buf, const void* src, size_t bytes) = 0;
+    virtual void         download_buffer(BufferHandle buf, void* dst, size_t bytes) = 0;
 
     virtual size_t       get_kernel_spirv_words(BenchKernelId id) const = 0;
     virtual KernelHandle compile_kernel(BenchKernelId id, uint32_t salt, double* out_cpu_compile_ns = nullptr) = 0;

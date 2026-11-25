@@ -357,7 +357,13 @@ void Calibrator::run_mb4_tiled_gemm(DeviceProfile& out, BufferHandle shared_src_
     out.smem_vs_cache_speedup = out.gflops_matmul_smem / std::max(1e-6, out.gflops_matmul_cache);
     out.prefer_shared_mem     = (out.smem_vs_cache_speedup > 1.05);
     out.tail_efficiency       = std::clamp(gflops_tail / std::max(1e-6, out.gflops_matmul_smem), 0.25, 1.0);
-    out.fusion_reg_factor     = std::clamp(gflops_fused_erf / std::max(1e-6, out.gflops_matmul_smem), 0.20, 1.0);
+    double flops_ref      = 2.0 * static_cast<double>(M) * static_cast<double>(N) * static_cast<double>(K);
+    double t_smem_ns      = flops_ref / std::max(1e-6, out.gflops_matmul_smem);
+    double t_fused_ns     = flops_ref / std::max(1e-6, gflops_fused_erf);
+    double t_ep_expect_ns = (static_cast<double>(M * N) / std::max(1.0, out.pi_gelu_erf_gelem_s)) +
+                            (static_cast<double>(M * N * 2u) / std::max(10.0, out.pi_fma_gflops));
+    double t_mm_net_ns    = std::max(t_smem_ns, t_fused_ns - t_ep_expect_ns);
+    out.fusion_reg_factor = std::clamp(t_smem_ns / t_mm_net_ns, 0.20, 1.0);
 
     if (cfg_.verbose) {
         std::cout << std::setprecision(2) << "[MB4 Tiled]    SMEM = " << out.gflops_matmul_smem
@@ -654,8 +660,8 @@ DeviceProfile Calibrator::run_full() {
     ts = std::chrono::steady_clock::now(); run_mb1_dispatch(prof);                                   prof.stage_timings.mb1_dispatch_ms = ms_since(ts);
     ts = std::chrono::steady_clock::now(); run_mb2_cache_hierarchy(prof, shared_src_buf, max_bytes); prof.stage_timings.mb2_cache_ms    = ms_since(ts);
     ts = std::chrono::steady_clock::now(); run_mb3_stride(prof, shared_src_buf, max_bytes);          prof.stage_timings.mb3_stride_ms   = ms_since(ts);
-    ts = std::chrono::steady_clock::now(); run_mb4_tiled_gemm(prof, shared_src_buf);                 prof.stage_timings.mb4_tiled_ms    = ms_since(ts);
     ts = std::chrono::steady_clock::now(); run_mb5_compute_and_waves(prof);                          prof.stage_timings.mb5_compute_ms  = ms_since(ts);
+    ts = std::chrono::steady_clock::now(); run_mb4_tiled_gemm(prof, shared_src_buf);                 prof.stage_timings.mb4_tiled_ms    = ms_since(ts);
     run_mb6_compile_ols(prof, shared_src_buf);
 
     backend_.free_buffer(shared_src_buf);

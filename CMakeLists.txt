@@ -114,3 +114,6 @@ target_link_libraries(mgcm_oracle_verify PRIVATE mgcm_core)
 if(SLANG_LIB_DIR)
     set_target_properties(mgcm_oracle_verify PROPERTIES BUILD_RPATH "${SLANG_LIB_DIR}")
 endif()
+
+add_executable(test_vulkan_correctness tests/test_vulkan_correctness.cpp)
+target_link_libraries(test_vulkan_correctness PRIVATE mgcm_core)

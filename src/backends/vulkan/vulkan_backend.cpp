@@ -500,7 +500,7 @@ StaticDeviceProps VulkanBackend::query_static_props() const { return impl_->prop
 BufferHandle VulkanBackend::allocate_buffer(size_t size_bytes) {
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size        = size_bytes;
-    bci.usage       = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bci.usage       = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
     Impl::BufferObj bo{};
@@ -971,6 +971,59 @@ TimingResult VulkanBackend::execute_chain(std::span<const DispatchDesc> chain) {
     vkFreeDescriptorSets(impl_->device, impl_->desc_pool, static_cast<uint32_t>(step_sets.size()), step_sets.data());
     return {std::chrono::duration<double, std::nano>(t1 - t0).count(),
             static_cast<double>(ts[1] - ts[0]) * impl_->props.timestamp_period_ns};
+}
+
+
+void VulkanBackend::upload_buffer(BufferHandle buf, const void* src, size_t bytes) {
+    const auto& bo = impl_->buffers.at(buf);
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, nullptr};
+    VkBuffer stg = VK_NULL_HANDLE; VK_CHECK(vkCreateBuffer(impl_->device, &bci, nullptr, &stg));
+    VkMemoryRequirements req{}; vkGetBufferMemoryRequirements(impl_->device, stg, &req);
+    VkPhysicalDeviceMemoryProperties mp{}; vkGetPhysicalDeviceMemoryProperties(impl_->phys_dev, &mp);
+    uint32_t mt = UINT32_MAX;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; ++i)
+        if ((req.memoryTypeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & 0x06) == 0x06) { mt = i; break; }
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, req.size, mt};
+    VkDeviceMemory mem = VK_NULL_HANDLE; VK_CHECK(vkAllocateMemory(impl_->device, &mai, nullptr, &mem));
+    VK_CHECK(vkBindBufferMemory(impl_->device, stg, mem, 0));
+    void* ptr = nullptr; VK_CHECK(vkMapMemory(impl_->device, mem, 0, bytes, 0, &ptr));
+    std::memcpy(ptr, src, bytes); vkUnmapMemory(impl_->device, mem);
+    VK_CHECK(vkResetCommandBuffer(impl_->cmd_buf, 0));
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, nullptr};
+    VK_CHECK(vkBeginCommandBuffer(impl_->cmd_buf, &bi));
+    VkBufferCopy cp{0, 0, bytes}; vkCmdCopyBuffer(impl_->cmd_buf, stg, bo.buffer, 1, &cp);
+    VK_CHECK(vkEndCommandBuffer(impl_->cmd_buf));
+    VK_CHECK(vkResetFences(impl_->device, 1, &impl_->fence));
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &impl_->cmd_buf, 0, nullptr};
+    VK_CHECK(vkQueueSubmit(impl_->queue, 1, &si, impl_->fence));
+    VK_CHECK(vkWaitForFences(impl_->device, 1, &impl_->fence, VK_TRUE, UINT64_MAX));
+    vkDestroyBuffer(impl_->device, stg, nullptr); vkFreeMemory(impl_->device, mem, nullptr);
+}
+
+void VulkanBackend::download_buffer(BufferHandle buf, void* dst, size_t bytes) {
+    const auto& bo = impl_->buffers.at(buf);
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, nullptr};
+    VkBuffer stg = VK_NULL_HANDLE; VK_CHECK(vkCreateBuffer(impl_->device, &bci, nullptr, &stg));
+    VkMemoryRequirements req{}; vkGetBufferMemoryRequirements(impl_->device, stg, &req);
+    VkPhysicalDeviceMemoryProperties mp{}; vkGetPhysicalDeviceMemoryProperties(impl_->phys_dev, &mp);
+    uint32_t mt = UINT32_MAX;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; ++i)
+        if ((req.memoryTypeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & 0x06) == 0x06) { mt = i; break; }
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, req.size, mt};
+    VkDeviceMemory mem = VK_NULL_HANDLE; VK_CHECK(vkAllocateMemory(impl_->device, &mai, nullptr, &mem));
+    VK_CHECK(vkBindBufferMemory(impl_->device, stg, mem, 0));
+    VK_CHECK(vkResetCommandBuffer(impl_->cmd_buf, 0));
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, nullptr};
+    VK_CHECK(vkBeginCommandBuffer(impl_->cmd_buf, &bi));
+    VkBufferCopy cp{0, 0, bytes}; vkCmdCopyBuffer(impl_->cmd_buf, bo.buffer, stg, 1, &cp);
+    VK_CHECK(vkEndCommandBuffer(impl_->cmd_buf));
+    VK_CHECK(vkResetFences(impl_->device, 1, &impl_->fence));
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &impl_->cmd_buf, 0, nullptr};
+    VK_CHECK(vkQueueSubmit(impl_->queue, 1, &si, impl_->fence));
+    VK_CHECK(vkWaitForFences(impl_->device, 1, &impl_->fence, VK_TRUE, UINT64_MAX));
+    void* ptr = nullptr; VK_CHECK(vkMapMemory(impl_->device, mem, 0, bytes, 0, &ptr));
+    std::memcpy(dst, ptr, bytes); vkUnmapMemory(impl_->device, mem);
+    vkDestroyBuffer(impl_->device, stg, nullptr); vkFreeMemory(impl_->device, mem, nullptr);
 }
 
 } // namespace mgcm
