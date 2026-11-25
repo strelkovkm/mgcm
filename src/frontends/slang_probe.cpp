@@ -37,9 +37,25 @@ bool map_kernel_to_slang(BenchKernelId id, const char** out_file, const char** o
             *out_entry = "mb5_gelu_erf";
             return true;
         case BenchKernelId::MB6_MatmulFusedGeluErf:
-            *out_file  = "mb4_tiled_matmul.slang";
-            *out_entry = "mb6_matmul_fused_gelu_erf";
-            return true;
+            *out_file = "mb4_tiled_matmul.slang"; *out_entry = "mb6_matmul_fused_gelu_erf"; return true;
+        case BenchKernelId::Ora_MatmulOnly:
+            *out_file = "oracle_mlp.slang"; *out_entry = "ora_matmul_only"; return true;
+        case BenchKernelId::Ora_MatmulBias:
+            *out_file = "oracle_mlp.slang"; *out_entry = "ora_matmul_bias"; return true;
+        case BenchKernelId::Ora_MatmulBiasGelu:
+            *out_file = "oracle_mlp.slang"; *out_entry = "ora_matmul_bias_gelu"; return true;
+        case BenchKernelId::Ora_MatmulBiasRelu:
+            *out_file = "oracle_mlp.slang"; *out_entry = "ora_matmul_bias_relu"; return true;
+        case BenchKernelId::Ora_ElemAdd:
+            *out_file = "oracle_mlp.slang"; *out_entry = "ora_elem_add"; return true;
+        case BenchKernelId::Ora_ElemGelu:
+            *out_file = "oracle_mlp.slang"; *out_entry = "ora_elem_gelu"; return true;
+        case BenchKernelId::Ora_ElemRelu:
+            *out_file = "oracle_mlp.slang"; *out_entry = "ora_elem_relu"; return true;
+        case BenchKernelId::Ora_ElemAddGelu:
+            *out_file = "oracle_mlp.slang"; *out_entry = "ora_elem_add_gelu"; return true;
+        case BenchKernelId::Ora_ElemAddRelu:
+            *out_file = "oracle_mlp.slang"; *out_entry = "ora_elem_add_relu"; return true;
         default:
             return false;
     }

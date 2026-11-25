@@ -14,6 +14,15 @@
 #include "mb5_gelu_erf.hpp"
 #include "mb5_gelu_tanh.hpp"
 #include "mb6_matmul_fused_gelu_erf.hpp"
+#include "ora_elem_add.hpp"
+#include "ora_elem_add_gelu.hpp"
+#include "ora_elem_add_relu.hpp"
+#include "ora_elem_gelu.hpp"
+#include "ora_elem_relu.hpp"
+#include "ora_matmul_bias.hpp"
+#include "ora_matmul_bias_gelu.hpp"
+#include "ora_matmul_bias_relu.hpp"
+#include "ora_matmul_only.hpp" 
 
 #include <algorithm>
 #include <chrono>
@@ -166,9 +175,16 @@ std::span<const uint32_t> get_builtin_spirv(BenchKernelId id, const char** out_e
         case BenchKernelId::MB5_GeluErf:
             *out_entry = "mb5_gelu_erf";
             return spirv::k_mb5_gelu_erf;
-        case BenchKernelId::MB6_MatmulFusedGeluErf:
-            *out_entry = "mb6_matmul_fused_gelu_erf";
-            return spirv::k_mb6_matmul_fused_gelu_erf;
+        case BenchKernelId::MB6_MatmulFusedGeluErf: *out_entry = "mb6_matmul_fused_gelu_erf"; return spirv::k_mb6_matmul_fused_gelu_erf;
+        case BenchKernelId::Ora_MatmulOnly: *out_entry = "ora_matmul_only"; return spirv::k_ora_matmul_only;
+        case BenchKernelId::Ora_MatmulBias: *out_entry = "ora_matmul_bias"; return spirv::k_ora_matmul_bias;
+        case BenchKernelId::Ora_MatmulBiasGelu: *out_entry = "ora_matmul_bias_gelu"; return spirv::k_ora_matmul_bias_gelu;
+        case BenchKernelId::Ora_MatmulBiasRelu: *out_entry = "ora_matmul_bias_relu"; return spirv::k_ora_matmul_bias_relu;
+        case BenchKernelId::Ora_ElemAdd: *out_entry = "ora_elem_add"; return spirv::k_ora_elem_add;
+        case BenchKernelId::Ora_ElemGelu: *out_entry = "ora_elem_gelu"; return spirv::k_ora_elem_gelu;
+        case BenchKernelId::Ora_ElemRelu: *out_entry = "ora_elem_relu"; return spirv::k_ora_elem_relu;
+        case BenchKernelId::Ora_ElemAddGelu: *out_entry = "ora_elem_add_gelu"; return spirv::k_ora_elem_add_gelu;
+        case BenchKernelId::Ora_ElemAddRelu: *out_entry = "ora_elem_add_relu"; return spirv::k_ora_elem_add_relu;
     }
     throw std::runtime_error("Unknown BenchKernelId");
 }
@@ -896,6 +912,65 @@ double VulkanBackend::measure_pipeline_cache_hit_ms(BenchKernelId id) {
 
     std::sort(hit_ms.begin(), hit_ms.end());
     return hit_ms[hit_ms.size() / 2];
+}
+
+
+TimingResult VulkanBackend::execute_chain(std::span<const DispatchDesc> chain) {
+    if (chain.empty()) return {};
+    std::vector<VkDescriptorSet> step_sets(chain.size(), VK_NULL_HANDLE);
+    for (size_t s = 0; s < chain.size(); ++s) {
+        auto& ko = impl_->kernels.at(chain[s].kernel);
+        VkDescriptorSetAllocateInfo dsai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr, impl_->desc_pool, 1, &ko.set_layout};
+        VK_CHECK(vkAllocateDescriptorSets(impl_->device, &dsai, &step_sets[s]));
+        std::vector<VkDescriptorBufferInfo> dbi(chain[s].buffers.size());
+        std::vector<VkWriteDescriptorSet> wr(chain[s].buffers.size());
+        for (size_t i = 0; i < chain[s].buffers.size(); ++i) {
+            const auto& bo = impl_->buffers.at(chain[s].buffers[i]);
+            dbi[i] = {bo.buffer, 0, bo.size};
+            wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, step_sets[s], static_cast<uint32_t>(i), 0, 1,
+                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &dbi[i], nullptr};
+        }
+        vkUpdateDescriptorSets(impl_->device, static_cast<uint32_t>(wr.size()), wr.data(), 0, nullptr);
+    }
+
+    VK_CHECK(vkResetCommandBuffer(impl_->cmd_buf, 0));
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, nullptr};
+    VK_CHECK(vkBeginCommandBuffer(impl_->cmd_buf, &bi));
+    vkCmdResetQueryPool(impl_->cmd_buf, impl_->query_pool, 0, 2);
+    impl_->pfn_cmd_write_timestamp2(impl_->cmd_buf, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, impl_->query_pool, 0);
+
+    for (size_t s = 0; s < chain.size(); ++s) {
+        if (s > 0) {
+            VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, nullptr,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT};
+            VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO, nullptr, 0, 1, &mb, 0, nullptr, 0, nullptr};
+            impl_->pfn_cmd_pipeline_barrier2(impl_->cmd_buf, &dep);
+        }
+        auto& ko = impl_->kernels.at(chain[s].kernel);
+        std::array<Scalar32, 32> push_buf{};
+        std::copy(chain[s].scalars.begin(), chain[s].scalars.end(), push_buf.begin());
+        vkCmdBindPipeline(impl_->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ko.pipeline);
+        vkCmdBindDescriptorSets(impl_->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ko.pipe_layout, 0, 1, &step_sets[s], 0, nullptr);
+        vkCmdPushConstants(impl_->cmd_buf, ko.pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 128, push_buf.data());
+        vkCmdDispatch(impl_->cmd_buf, chain[s].group_count[0], chain[s].group_count[1], chain[s].group_count[2]);
+    }
+
+    impl_->pfn_cmd_write_timestamp2(impl_->cmd_buf, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, impl_->query_pool, 1);
+    VK_CHECK(vkEndCommandBuffer(impl_->cmd_buf));
+    VK_CHECK(vkResetFences(impl_->device, 1, &impl_->fence));
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &impl_->cmd_buf, 0, nullptr};
+    auto t0 = std::chrono::steady_clock::now();
+    VK_CHECK(vkQueueSubmit(impl_->queue, 1, &si, impl_->fence));
+    VK_CHECK(vkWaitForFences(impl_->device, 1, &impl_->fence, VK_TRUE, UINT64_MAX));
+    auto t1 = std::chrono::steady_clock::now();
+
+    uint64_t ts[2] = {0, 0};
+    VK_CHECK(vkGetQueryPoolResults(impl_->device, impl_->query_pool, 0, 2, sizeof(ts), ts, sizeof(uint64_t),
+                                   VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
+    vkFreeDescriptorSets(impl_->device, impl_->desc_pool, static_cast<uint32_t>(step_sets.size()), step_sets.data());
+    return {std::chrono::duration<double, std::nano>(t1 - t0).count(),
+            static_cast<double>(ts[1] - ts[0]) * impl_->props.timestamp_period_ns};
 }
 
 } // namespace mgcm

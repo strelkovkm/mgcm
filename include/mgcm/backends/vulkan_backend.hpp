@@ -36,11 +36,12 @@ public:
     void         free_buffer(BufferHandle buf) override;
 
     size_t       get_kernel_spirv_words(BenchKernelId id) const override;
-    KernelHandle compile_kernel(BenchKernelId id, uint32_t salt, double* out_cpu_compile_ns) override;
+    KernelHandle compile_kernel(BenchKernelId id, uint32_t salt, double* out_cpu_compile_ns = nullptr) override;
     void         destroy_kernel(KernelHandle kernel) override;
     double       measure_pipeline_cache_hit_ms(BenchKernelId id) override;
 
     TimingResult execute(const DispatchDesc& desc) override;
+    TimingResult execute_chain(std::span<const DispatchDesc> chain) override;
 
 private:
     explicit VulkanBackend(const ExternalVulkanHandles& external);

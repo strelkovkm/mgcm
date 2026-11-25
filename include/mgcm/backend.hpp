@@ -41,7 +41,16 @@ enum class BenchKernelId : uint8_t {
     MB5_Fma16,
     MB5_GeluTanh,
     MB5_GeluErf,
-    MB6_MatmulFusedGeluErf
+    MB6_MatmulFusedGeluErf,
+    Ora_MatmulOnly,
+    Ora_MatmulBias,
+    Ora_MatmulBiasGelu,
+    Ora_MatmulBiasRelu,
+    Ora_ElemAdd,
+    Ora_ElemGelu,
+    Ora_ElemRelu,
+    Ora_ElemAddGelu,
+    Ora_ElemAddRelu
 };
 
 using BufferHandle = uint64_t;
@@ -106,6 +115,7 @@ public:
     virtual double       measure_pipeline_cache_hit_ms(BenchKernelId id) = 0;
 
     virtual TimingResult execute(const DispatchDesc& desc) = 0;
+    virtual TimingResult execute_chain(std::span<const DispatchDesc> chain) = 0;
 };
 
 } // namespace mgcm
