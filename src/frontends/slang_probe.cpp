@@ -90,7 +90,7 @@ public:
 
         slang::TargetDesc target{};
         target.format  = SLANG_SPIRV;
-        target.profile = global_session_->findProfile("spirv_1_3");
+        target.profile = global_session_->findProfile("spirv_1_6");
         target.flags   = SLANG_TARGET_FLAG_GENERATE_SPIRV_DIRECTLY;
 
         slang::CompilerOptionEntry opt{};

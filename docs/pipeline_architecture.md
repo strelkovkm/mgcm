@@ -24,7 +24,7 @@ $$T_{\text{compile}}^{\text{total}}(P, \theta) = \sum_{k \in P} \Bigg[ \mathbb{I
 * **Theoretical Justification & Applicability Domain:** Single-pass SSA construction and Linear Scan register allocation in JIT backends exhibit $O(L_{\text{IR}})$ linear scaling in instruction length (*Poletto & Sarkar, ACM TOPLAS 1999*; *Braun et al., CC 2013*), while amortized operator-fusion trade-offs follow $T_C + R \cdot T_X$ (*Niu et al., DNNFusion, ACM PLDI 2021*; *Kamei & Costa, CBSoft 2026*). Linearity over $L_{\text{spv}} \le 12\,000$ words is empirically verified per device via $R^2$ stored in `DeviceProfile` (validity threshold: $R^2 \ge 0.95$).
 
 ### 2.2. Analytical Pre-Compilation SPIR-V Length Estimator $\widehat{L}_{\text{spv}}^{(c)}(k, \theta)$
-Because boundary selection runs prior to invoking `GC` or `Slang`, the 32-bit SPIR-V word length is predicted deterministically via syntax-directed translation rules (*Khronos SPIR-V Spec v1.3, §3*; *Aho et al., Compilers, 2nd ed., Ch. 5*):
+Because boundary selection runs prior to invoking `GC` or `Slang`, the 32-bit SPIR-V word length is predicted deterministically via syntax-directed translation rules (*Khronos SPIR-V Spec v1.6, §3*; *Aho et al., Compilers, 2nd ed., Ch. 5*):
 
 $$S_{\text{ld}}(\theta) = \left\lceil \frac{BM \cdot BK}{N_{\text{threads}}(\theta)} \right\rceil + \left\lceil \frac{BK \cdot BN}{N_{\text{threads}}(\theta)} \right\rceil$$
 

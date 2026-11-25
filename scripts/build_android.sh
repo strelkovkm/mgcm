@@ -29,7 +29,7 @@ cmake -G Ninja \
     -B "${BUILD_DIR}" \
     -DCMAKE_TOOLCHAIN_FILE="${NDK_DIR}/build/cmake/android.toolchain.cmake" \
     -DANDROID_ABI=arm64-v8a \
-    -DANDROID_PLATFORM=android-29 \
+    -DANDROID_PLATFORM=android-33 \
     -DANDROID_STL=c++_static \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \

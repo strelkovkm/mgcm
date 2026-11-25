@@ -286,6 +286,9 @@ VulkanBackend::VulkanBackend(uint32_t device_index, bool include_cpu) : impl_(st
     VkPhysicalDeviceProperties base_pr{};
     vkGetPhysicalDeviceProperties(impl_->phys_dev, &base_pr);
     uint32_t dev_api = base_pr.apiVersion;
+    if (dev_api < VK_API_VERSION_1_3) {
+        throw std::runtime_error("Vulkan 1.3 required (device reports " + format_vk_version(dev_api) + ")");
+    }
 
     VkPhysicalDeviceVulkan13Properties p13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES};
     VkPhysicalDeviceVulkan12Properties p12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
@@ -419,6 +422,9 @@ VulkanBackend::VulkanBackend(uint32_t device_index, bool include_cpu) : impl_(st
             reinterpret_cast<PFN_vkCmdWriteTimestamp2>(vkGetDeviceProcAddr(impl_->device, "vkCmdWriteTimestamp2KHR"));
     }
     impl_->use_sync2 = (impl_->pfn_cmd_pipeline_barrier2 != nullptr && impl_->pfn_cmd_write_timestamp2 != nullptr);
+    if (!impl_->use_sync2) {
+        throw std::runtime_error("Vulkan 1.3 Synchronization2 entry points are required");
+    }
 
     VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     cpci.flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -736,6 +742,9 @@ VulkanBackend::VulkanBackend(const ExternalVulkanHandles& ext) : impl_(std::make
     VkPhysicalDeviceProperties base_pr{};
     vkGetPhysicalDeviceProperties(impl_->phys_dev, &base_pr);
     uint32_t dev_api = base_pr.apiVersion;
+    if (dev_api < VK_API_VERSION_1_3) {
+        throw std::runtime_error("Vulkan 1.3 required (device reports " + format_vk_version(dev_api) + ")");
+    }
 
     VkPhysicalDeviceVulkan13Properties p13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES};
     VkPhysicalDeviceVulkan12Properties p12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
@@ -786,6 +795,9 @@ VulkanBackend::VulkanBackend(const ExternalVulkanHandles& ext) : impl_(std::make
     impl_->pfn_cmd_write_timestamp2 =
         reinterpret_cast<PFN_vkCmdWriteTimestamp2>(vkGetDeviceProcAddr(impl_->device, "vkCmdWriteTimestamp2"));
     impl_->use_sync2 = (dev_api >= VK_API_VERSION_1_3 && impl_->pfn_cmd_pipeline_barrier2 && impl_->pfn_cmd_write_timestamp2);
+    if (!impl_->use_sync2) {
+        throw std::runtime_error("Vulkan 1.3 Synchronization2 entry points are required");
+    }
 
     VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     cpci.flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
