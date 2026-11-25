@@ -133,6 +133,7 @@ void Calibrator::run_mb1_dispatch(DeviceProfile& out) {
     const std::vector<uint32_t> chain_lens = {1, 8, 32, 128};
     std::vector<double> xs, y_nobar, y_bar;
     double cpu_1 = 0.0, gpu_1 = 0.0;
+    out.mb1_points.clear();
 
     for (uint32_t n : chain_lens) {
         auto [c_nb, g_nb] = measure_chain(n, false);
@@ -145,6 +146,7 @@ void Calibrator::run_mb1_dispatch(DeviceProfile& out) {
         xs.push_back(static_cast<double>(n));
         y_nobar.push_back(g_nb);
         y_bar.push_back(g_b);
+        out.mb1_points.push_back({n, g_nb, g_b});
     }
 
     auto fit_nb = fit_ols_1d(xs, y_nobar, false);
@@ -761,7 +763,7 @@ std::string Calibrator::to_json_string(const DeviceProfile& p) {
     j["mb1_dispatch"]             = {{"t_submit_cpu_us", p.t_submit_cpu_us},
                                      {"t_launch_gpu_us", p.t_launch_gpu_us},
                                      {"t_barrier_gpu_us", p.t_barrier_gpu_us},
-                                     {"r2_dispatch", p.r2_dispatch}};
+                                     {"r2_dispatch", p.r2_dispatch}, {"points", [&]{ nlohmann::json a = nlohmann::json::array(); for (auto& x : p.mb1_points) a.push_back({x.chain_len, x.nobar_gpu_us, x.bar_gpu_us}); return a; }()}};
     nlohmann::json bw_arr         = nlohmann::json::array();
     for (const auto& pt : p.bw_curve) bw_arr.push_back({pt.working_set_bytes, pt.bw_median_gbps, pt.bw_iqr_gbps});
     j["mb2_memory"]     = {{"l2_effective_bytes", p.l2_effective_bytes},
@@ -834,6 +836,7 @@ DeviceProfile Calibrator::from_json_string(const std::string& json_text) {
     p.t_launch_gpu_us  = j1.value("t_launch_gpu_us", 0.0);
     p.t_barrier_gpu_us = j1.value("t_barrier_gpu_us", 0.0);
     p.r2_dispatch      = j1.value("r2_dispatch", 1.0);
+    if (j1.contains("points")) for (auto& r : j1["points"]) p.mb1_points.push_back({r[0].get<uint32_t>(), r[1].get<double>(), r[2].get<double>()});
 
     const auto& j2       = j.at("mb2_memory");
     p.l2_effective_bytes = j2.value("l2_effective_bytes", size_t{0});

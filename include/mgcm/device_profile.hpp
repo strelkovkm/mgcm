@@ -19,6 +19,12 @@ struct WaveSaturationPoint {
     double   gpu_time_us = 0.0;
 };
 
+struct DispatchSamplePoint {
+    uint32_t chain_len    = 0;
+    double   nobar_gpu_us = 0.0;
+    double   bar_gpu_us   = 0.0;
+};
+
 struct CompileSamplePoint {
     uint32_t spirv_words = 0;
     double   time_ms     = 0.0;
@@ -62,7 +68,8 @@ struct DeviceProfile {
     double t_submit_cpu_us  = 0.0;
     double t_launch_gpu_us  = 0.0;
     double t_barrier_gpu_us = 0.0;
-    double r2_dispatch      = 0.0;
+    double                           r2_dispatch = 0.0;
+    std::vector<DispatchSamplePoint> mb1_points;
 
     // Stage 2 (MB2): Memory Hierarchy Curve & Summary (Fields 13-16)
     std::vector<BandwidthPoint> bw_curve;
