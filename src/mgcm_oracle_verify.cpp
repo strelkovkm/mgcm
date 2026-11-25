@@ -163,7 +163,7 @@ int main(int argc, char** argv) {
             auto wk = vk.compile_kernel(mgcm::BenchKernelId::MB0_Warmup, 0);
             std::array<mgcm::BufferHandle, 1> wb{buf_y};
             std::array<mgcm::Scalar32, 4> ws{mgcm::Scalar32::U32(8192), mgcm::Scalar32::F32(1.00001f), mgcm::Scalar32::F32(0.00001f), mgcm::Scalar32::F32(-999999.0f)};
-            for (int i = 0; i < 6; ++i) vk.execute({wk, wb, ws, {128, 1, 1}, {256, 1, 1}, 1, false});
+            double w_ms = 0.0; while (w_ms < 150.0) { w_ms += vk.execute({wk, wb, ws, {128, 1, 1}, {256, 1, 1}, 1, false}).cpu_wall_ns * 1e-6; }
             vk.destroy_kernel(wk);
         }
         for (uint32_t M : ms) {

@@ -8,5 +8,8 @@ struct NoopParams {
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void mb1_noop(uint3 tid : SV_DispatchThreadID) {
-    if (float(tid.x + npc.flag) == npc.impossible_sink) noop_out[tid.x] = 1.0f;
+    // Dirty 1 cache line per subgroup so RAW barriers measure real GL2/L2 writeback & invalidation
+    if ((tid.x & 15u) == 0u) {
+        noop_out[tid.x] = float(npc.flag) * 1.0001f + ((npc.impossible_sink == -12345.0f) ? 0.5f : 0.0f);
+    }
 }

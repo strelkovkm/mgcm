@@ -110,7 +110,7 @@ std::vector<PartitionWorkload> MlpBlock::build_candidates(uint32_t device_wave_q
         return kw;
     };
 
-    auto make_elem_kernel = [&](const EpilogueProfile& ep, bool drv_cached) {
+    auto make_elem_kernel = [&](const EpilogueProfile& ep, bool drv_cached, double producer_ws_bytes) {
         KernelWorkload kw{};
         kw.frontend       = cfg_.frontend;
         kw.fe_cache_miss  = !(cfg_.fe_cached || drv_cached);
@@ -127,7 +127,7 @@ std::vector<PartitionWorkload> MlpBlock::build_candidates(uint32_t device_wave_q
         kw.elems_act_padded         = (ep.act_pipe != ActivationPipe::None) ? e_pad : 0.0;
         kw.act_pipe                 = ep.act_pipe;
         kw.bytes_cold               = bytes_c + (ep.has_bias_buffer ? bytes_bias : 0.0) + bytes_c;
-        kw.cold_working_set_bytes   = bytes_c;
+        kw.cold_working_set_bytes   = bytes_c + producer_ws_bytes;
         kw.bytes_reuse              = 0.0;
         kw.reuse_working_set_bytes  = 0.0;
         kw.read_stride_elems        = 1u;
@@ -142,20 +142,20 @@ std::vector<PartitionWorkload> MlpBlock::build_candidates(uint32_t device_wave_q
     if (cfg_.allowed_plans_mask & plan_bit(PartitionPlan::P0_SplitAll)) {
         out.push_back({PartitionPlan::P0_SplitAll,
                        {make_matmul_kernel(EpilogueProfile::none(), true),
-                        make_elem_kernel(ep_bias, cfg_.base_mm_drv_cached),
-                        make_elem_kernel(ep_act, cfg_.base_mm_drv_cached)},
+                        make_elem_kernel(ep_bias, cfg_.base_mm_drv_cached, bytes_b),
+                        make_elem_kernel(ep_act, cfg_.base_mm_drv_cached, bytes_c)},
                        0,
                        0.0});
     }
     if (cfg_.allowed_plans_mask & plan_bit(PartitionPlan::P1_FusedBias)) {
         out.push_back({PartitionPlan::P1_FusedBias,
-                       {make_matmul_kernel(ep_bias, false), make_elem_kernel(ep_act, cfg_.base_mm_drv_cached)},
+                       {make_matmul_kernel(ep_bias, false), make_elem_kernel(ep_act, cfg_.base_mm_drv_cached, bytes_c)},
                        0,
                        0.0});
     }
     if (cfg_.allowed_plans_mask & plan_bit(PartitionPlan::P2_FusedEpilogue)) {
         out.push_back({PartitionPlan::P2_FusedEpilogue,
-                       {make_matmul_kernel(EpilogueProfile::none(), true), make_elem_kernel(ep_bias_act, false)},
+                       {make_matmul_kernel(EpilogueProfile::none(), true), make_elem_kernel(ep_bias_act, false, bytes_b)},
                        0,
                        0.0});
     }

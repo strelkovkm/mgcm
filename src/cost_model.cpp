@@ -112,10 +112,8 @@ PlanEstimate UniversalCostEngine::estimate_partition(const PartitionWorkload& pw
         // Compute stage across GEMM, vector FMA, and activation GElem/s pipes
         double t_comp_us = 0.0;
         if (kw.flops_contraction_padded > 0.0) {
-            double pi_gemm = kw.uses_shared_mem ? prof_.gflops_matmul_smem : prof_.gflops_matmul_cache;
-            if (!kw.uses_shared_mem && kw.read_stride_elems > 1u) {
-                pi_gemm = std::max(10.0, 0.35 * prof_.pi_fma_gflops);
-            }
+            double occ_ref = wave_occupancy(256u);
+            double pi_gemm = (kw.uses_shared_mem ? prof_.gflops_matmul_smem : prof_.gflops_matmul_cache) / occ_ref;
             pi_gemm        = std::max(1.0, pi_gemm);
             double eta_t   = kw.has_unaligned_tail ? std::clamp(prof_.tail_efficiency, 0.1, 1.0) : 1.0;
             double eta_f   = kw.has_fused_heavy_act ? std::clamp(prof_.fusion_reg_factor, 0.1, 1.0) : 1.0;
@@ -133,13 +131,19 @@ PlanEstimate UniversalCostEngine::estimate_partition(const PartitionWorkload& pw
         // Memory stage via empirical MB2 log-linear curve + MB3 stride coalescing
         double t_mem_us = 0.0;
         if (ablation != AblationMode::NoMemoryTraffic) {
+            const double bw_l2_ref = std::max(1.0, prof_.bw_l2_gbps);
+            auto mem_term_us = [&](double bytes, double ws, uint32_t stride) {
+                double bw = empirical_bw_gbps(ws, stride);
+                if (kw.flops_contraction_padded > 0.0 && stride == 1u) {
+                    return bytes * std::max(0.0, (1.0 / bw) - (1.0 / bw_l2_ref)) * 1e-3;
+                }
+                return (bytes / bw) * 1e-3;
+            };
             if (kw.bytes_cold > 0.0) {
-                double bw_cold = empirical_bw_gbps(kw.cold_working_set_bytes, 1u);
-                t_mem_us += (kw.bytes_cold / bw_cold) * 1e-3;
+                t_mem_us += mem_term_us(kw.bytes_cold, kw.cold_working_set_bytes, 1u);
             }
             if (kw.bytes_reuse > 0.0) {
-                double bw_reuse = empirical_bw_gbps(kw.reuse_working_set_bytes, kw.read_stride_elems);
-                t_mem_us += (kw.bytes_reuse / bw_reuse) * 1e-3;
+                t_mem_us += mem_term_us(kw.bytes_reuse, kw.reuse_working_set_bytes, kw.read_stride_elems);
             }
         }
 
