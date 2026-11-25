@@ -9,7 +9,8 @@ import numpy as np
 
 R_GRID = [1, 2, 5, 10, 20, 50, 100, 250, 500, 1000, 5000, 20000]
 COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"]
-REGRET_FORMULA = r"$\mathrm{Regret} = \frac{C(P_{\mathrm{pred}}) - C(P_{\mathrm{oracle}})}{C(P_{\mathrm{oracle}})} \times 100\%$"
+REGRET_FORMULA = r"$\mathrm{Regret}(P) = \frac{C(P) - C(P_{\mathrm{oracle}})}{C(P_{\mathrm{oracle}})} \times 100\%$"
+VALUE_FORMULA = r"$\mathrm{Value} = \frac{C(P_0) - C(P_{\mathrm{pred}})}{C(P_{\mathrm{oracle}})} \times 100\%$"
 
 
 def pearson_r(x, y):
@@ -18,6 +19,40 @@ def pearson_r(x, y):
 
 def mape_pct(pred, real):
     return float(np.mean(np.abs(pred - real) / np.maximum(1e-9, real)) * 100.0)
+
+
+def draw_phase_panel(ax, grid, ms, ttl, cmap, norm):
+    short = {0: "P0", 1: "P1", 2: "P2", 3: "P3"}
+    ax.imshow(grid, origin="lower", aspect="auto", cmap=cmap, norm=norm)
+    for ri in range(len(R_GRID)):
+        for mi in range(len(ms)):
+            ax.text(mi, ri, short[int(grid[ri, mi])], ha="center", va="center", fontsize=6.5)
+    ax.set_xticks(range(len(ms)))
+    ax.set_xticklabels([str(m) for m in ms], rotation=45, fontsize=7.2)
+    ax.set_yticks(range(len(R_GRID)))
+    ax.set_yticklabels([str(r) for r in R_GRID], fontsize=7.8)
+    ax.set_xlabel("Rows M (N=3072, K=768)")
+    ax.set_ylabel("Model Runs R")
+    ax.set_title(ttl, fontsize=9.6)
+
+
+def draw_heat_panel(ax, fig, grid, ms, ttl, cmap_name, vmin, vmax, cbar_lbl):
+    im = ax.imshow(grid, origin="lower", aspect="auto", cmap=cmap_name, vmin=vmin, vmax=vmax)
+    span = max(1e-6, vmax - vmin)
+    for ri in range(len(R_GRID)):
+        for mi in range(len(ms)):
+            val = float(grid[ri, mi])
+            txt = "0" if abs(val) < 0.05 else (f"{val:.1f}" if abs(val) < 10.0 else f"{val:.0f}")
+            col = "white" if (val - vmin) > 0.58 * span else "#111111"
+            ax.text(mi, ri, txt, ha="center", va="center", fontsize=6.1, color=col)
+    ax.set_xticks(range(len(ms)))
+    ax.set_xticklabels([str(m) for m in ms], rotation=45, fontsize=7.2)
+    ax.set_yticks(range(len(R_GRID)))
+    ax.set_yticklabels([str(r) for r in R_GRID], fontsize=7.8)
+    ax.set_xlabel("Rows M (N=3072, K=768)")
+    ax.set_ylabel("Model Runs R")
+    ax.set_title(ttl, fontsize=9.2)
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.03, label=cbar_lbl)
 
 
 def analyze_file(csv_path: Path, out_dir: Path):
@@ -46,9 +81,13 @@ def analyze_file(csv_path: Path, out_dir: Path):
             "nodisp_e": float(r["pred_nodisp_exec_us"]),
         }
 
+    grid_p0 = np.zeros((len(R_GRID), len(ms)), dtype=int)
     grid_pred = np.zeros((len(R_GRID), len(ms)), dtype=int)
     grid_real = np.zeros((len(R_GRID), len(ms)), dtype=int)
-    grid_regret = np.zeros((len(R_GRID), len(ms)), dtype=float)
+
+    grid_reg_p0 = np.zeros((len(R_GRID), len(ms)), dtype=float)
+    grid_reg_pred = np.zeros((len(R_GRID), len(ms)), dtype=float)
+    grid_net_value = np.zeros((len(R_GRID), len(ms)), dtype=float)
 
     policies = {
         "Fixed: Always Split (P0)": [],
@@ -60,7 +99,7 @@ def analyze_file(csv_path: Path, out_dir: Path):
         "Proposed: UniversalCostEngine": [],
     }
 
-    matches = 0
+    matches_pred, matches_p0 = 0, 0
     for mi, m in enumerate(ms):
         d = by_m[m]
         for ri, rv in enumerate(R_GRID):
@@ -73,31 +112,44 @@ def analyze_file(csv_path: Path, out_dir: Path):
             nodisp_p = min(range(4), key=lambda p: d[p]["pc"] + rv * d[p]["nodisp_e"])
             nocomp_p = min(range(4), key=lambda p: rv * d[p]["pe"])
 
-            cell_reg = (real_cost[full_p] - oracle_c) / oracle_c * 100.0
+            calc_reg = lambda chosen: (real_cost[chosen] - oracle_c) / oracle_c * 100.0
+            reg_p0 = calc_reg(0)
+            reg_pred = calc_reg(full_p)
+
+            grid_p0[ri, mi] = 0
             grid_real[ri, mi] = oracle_p
             grid_pred[ri, mi] = full_p
-            grid_regret[ri, mi] = cell_reg
-            if full_p == oracle_p:
-                matches += 1
 
-            calc_reg = lambda chosen: (real_cost[chosen] - oracle_c) / oracle_c * 100.0
-            policies["Fixed: Always Split (P0)"].append(calc_reg(0))
+            grid_reg_p0[ri, mi] = reg_p0
+            grid_reg_pred[ri, mi] = reg_pred
+            grid_net_value[ri, mi] = reg_p0 - reg_pred
+
+            if full_p == oracle_p:
+                matches_pred += 1
+            if oracle_p == 0:
+                matches_p0 += 1
+
+            policies["Fixed: Always Split (P0)"].append(reg_p0)
             policies["Fixed: Always Partial (P2)"].append(calc_reg(2))
             policies["Fixed: Always Fuse (P3)"].append(calc_reg(3))
             policies["Ablation: NoMemoryTraffic"].append(calc_reg(nomem_p))
             policies["Ablation: NoDispatch"].append(calc_reg(nodisp_p))
             policies["Ablation: NoCompileCost"].append(calc_reg(nocomp_p))
-            policies["Proposed: UniversalCostEngine"].append(cell_reg)
+            policies["Proposed: UniversalCostEngine"].append(reg_pred)
 
-    agree_pct = matches / (len(ms) * len(R_GRID)) * 100.0
-    mean_reg = float(np.mean(grid_regret))
-    p95_reg = float(np.percentile(grid_regret, 95))
-    max_reg = float(np.max(grid_regret))
+    total_cells = len(ms) * len(R_GRID)
+    agree_pred = matches_pred / total_cells * 100.0
+    agree_p0 = matches_p0 / total_cells * 100.0
+
+    mean_p0, p95_p0, max_p0 = float(np.mean(grid_reg_p0)), float(np.percentile(grid_reg_p0, 95)), float(np.max(grid_reg_p0))
+    mean_pr, p95_pr, max_pr = float(np.mean(grid_reg_pred)), float(np.percentile(grid_reg_pred, 95)), float(np.max(grid_reg_pred))
+    mean_val, max_val = float(np.mean(grid_net_value)), float(np.max(grid_net_value))
 
     print(f"\n==================== [{tag}] IDENTICAL-CONDITION VULKAN 1.3 VERIFICATION ====================")
     print(f"T_execute Correlation : Pearson r = {r_exec:.5f} (R2 = {r_exec**2:.5f}) | MAPE = {mape_e:.2f}%")
     print(f"T_compile Correlation : Pearson r = {r_comp:.5f} | MAPE = {mape_c:.2f}%")
-    print(f"2D Phase Map Agreement: {agree_pct:.1f}% ({matches}/{len(ms)*len(R_GRID)} cells) | Mean Regret = {mean_reg:.3f}%")
+    print(f"Phase Map Agreement   : Baseline P0 = {agree_p0:.1f}% -> UniversalCostEngine = {agree_pred:.1f}% ({matches_pred}/{total_cells})")
+    print(f"Net Value vs P0       : Mean Savings = +{mean_val:.2f}% | Max Savings = +{max_val:.2f}% (Regret reduced {mean_p0/max(1e-4, mean_pr):.1f}x)")
     print("-" * 86)
     print(f"{'Policy / Ablation':<34} | {'Mean Regret (%)':>16} | {'P95 Regret (%)':>16} | {'Max Regret (%)':>14}")
     print("-" * 86)
@@ -107,50 +159,38 @@ def analyze_file(csv_path: Path, out_dir: Path):
         summary_stats[name] = float(np.mean(arr))
         print(f"{name:<34} | {np.mean(arr):>15.3f}% | {np.percentile(arr, 95):>15.3f}% | {np.max(arr):>13.3f}%")
 
-    # 3-Panel Figure: Predicted Map | Measured Oracle Map | Cell-wise Regret (%) Heatmap
-    fig, (ax_p, ax_r, ax_reg) = plt.subplots(1, 3, figsize=(17.5, 5.2), dpi=180)
-    cmap = mcolors.ListedColormap(["#6baed6", "#fdae6b", "#fd8d3c", "#74c476"])
-    norm = mcolors.BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5], cmap.N)
-    short = {0: "P0", 1: "P1", 2: "P2", 3: "P3"}
+    # 2x3 Master Figure:
+    # Top:    [Baseline All-P0 Map]      | [Predicted CostModel Map]        | [Measured Hardware Oracle Map]
+    # Bottom: [All-P0 Regret vs Oracle]  | [CostModel Regret (Same Scale!)] | [Net Value Unlocked over P0 (+%)]
+    fig, axs = plt.subplots(2, 3, figsize=(18.2, 9.6), dpi=180)
+    cmap_p = mcolors.ListedColormap(["#6baed6", "#fdae6b", "#fd8d3c", "#74c476"])
+    norm_p = mcolors.BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5], cmap_p.N)
 
-    for ax, grd, ttl in [
-        (ax_p, grid_pred, f"Predicted (UniversalCostEngine)\nAgreement = {agree_pct:.1f}%"),
-        (ax_r, grid_real, "Measured Hardware Oracle (Vulkan 1.3)"),
-    ]:
-        ax.imshow(grd, origin="lower", aspect="auto", cmap=cmap, norm=norm)
-        for ri in range(len(R_GRID)):
-            for mi in range(len(ms)):
-                ax.text(mi, ri, short[grd[ri, mi]], ha="center", va="center", fontsize=6.6)
-        ax.set_xticks(range(len(ms)))
-        ax.set_xticklabels([str(m) for m in ms], rotation=45, fontsize=7.2)
-        ax.set_yticks(range(len(R_GRID)))
-        ax.set_yticklabels([str(r) for r in R_GRID], fontsize=7.8)
-        ax.set_xlabel("Rows M (N=3072, K=768)")
-        ax.set_ylabel("Model Runs R")
-        ax.set_title(ttl, fontsize=9.8)
+    draw_phase_panel(axs[0, 0], grid_p0, ms, f"1. Baseline: Always Split (All P0)\nAgreement with Oracle = {agree_p0:.1f}%", cmap_p, norm_p)
+    draw_phase_panel(axs[0, 1], grid_pred, ms, f"2. Proposed: UniversalCostEngine\nAgreement with Oracle = {agree_pred:.1f}%", cmap_p, norm_p)
+    draw_phase_panel(axs[0, 2], grid_real, ms, "3. Measured Hardware Oracle (Vulkan 1.3)\nGround-Truth Optimal Partition P*", cmap_p, norm_p)
 
-    vmax = max(5.0, float(np.max(grid_regret)))
-    im_reg = ax_reg.imshow(grid_regret, origin="lower", aspect="auto", cmap="YlOrRd", vmin=0.0, vmax=vmax)
-    for ri in range(len(R_GRID)):
-        for mi in range(len(ms)):
-            val = grid_regret[ri, mi]
-            txt = "0" if val < 0.05 else (f"{val:.1f}" if val < 10.0 else f"{val:.0f}")
-            col = "white" if val > 0.55 * vmax else "#111111"
-            ax_reg.text(mi, ri, txt, ha="center", va="center", fontsize=6.2, color=col)
-    ax_reg.set_xticks(range(len(ms)))
-    ax_reg.set_xticklabels([str(m) for m in ms], rotation=45, fontsize=7.2)
-    ax_reg.set_yticks(range(len(R_GRID)))
-    ax_reg.set_yticklabels([str(r) for r in R_GRID], fontsize=7.8)
-    ax_reg.set_xlabel("Rows M (N=3072, K=768)")
-    ax_reg.set_title(
-        f"Cell Regret (%): Mean={mean_reg:.2f}%, P95={p95_reg:.2f}%, Max={max_reg:.1f}%\n" + REGRET_FORMULA,
-        fontsize=9.2,
+    shared_vmax = max(5.0, max_p0, max_pr)
+    draw_heat_panel(
+        axs[1, 0], fig, grid_reg_p0, ms,
+        f"4. Baseline All-P0 Regret (%): Mean={mean_p0:.2f}%, P95={p95_p0:.1f}%, Max={max_p0:.1f}%\n" + REGRET_FORMULA,
+        "YlOrRd", 0.0, shared_vmax, "Regret vs Oracle (%)",
     )
-    fig.colorbar(im_reg, ax=ax_reg, fraction=0.046, pad=0.03, label="Regret (%)")
+    draw_heat_panel(
+        axs[1, 1], fig, grid_reg_pred, ms,
+        f"5. Proposed CostModel Regret (%): Mean={mean_pr:.2f}%, P95={p95_pr:.2f}%, Max={max_pr:.1f}%\n" + REGRET_FORMULA,
+        "YlOrRd", 0.0, shared_vmax, "Regret vs Oracle (%)",
+    )
+    draw_heat_panel(
+        axs[1, 2], fig, grid_net_value, ms,
+        f"6. Net Value Unlocked over All-P0 (+%): Mean=+{mean_val:.2f}%, Max=+{max_val:.1f}%\n" + VALUE_FORMULA,
+        "YlGn", 0.0, shared_vmax, "Net Cost Savings vs P0 (%)",
+    )
 
     fig.suptitle(
-        f"[{tag}] Blind CostModel vs Vulkan 1.3 Oracle (Pearson r={r_exec:.4f}, MAPE={mape_e:.1f}%)",
-        fontsize=11.5,
+        f"[{tag}] Baseline All-P0 vs UniversalCostEngine vs Vulkan 1.3 Oracle "
+        f"(Pearson r={r_exec:.4f}, MAPE={mape_e:.1f}%, Regret Cut {mean_p0/max(1e-4, mean_pr):.1f}x)",
+        fontsize=12.2,
     )
     fig.tight_layout()
     out_p = out_dir / f"compare_phase_MR_{tag}.png"
@@ -164,7 +204,7 @@ def main():
     res_dir = Path(sys.argv[1]) if len(sys.argv[1:]) >= 1 else Path("results")
     vfiles = sorted(res_dir.glob("verify_*.csv"))
     if not vfiles:
-        sys.exit("No verify_*.csv found in results/")
+        sys.exit(f"No verify_*.csv found in {res_dir}")
 
     fig_s, ax_s = plt.subplots(figsize=(6.8, 5.6), dpi=180)
     lo_all, hi_all = 1e9, 0.0
@@ -190,7 +230,6 @@ def main():
     plt.close(fig_s)
     print(f"\nSaved -> {out_c}")
 
-    # Policy & Ablation Mean Regret comparison chart (log10 scale + exact labels)
     if all_stats:
         pol_names = list(all_stats[0][1].keys())
         x = np.arange(len(pol_names))
