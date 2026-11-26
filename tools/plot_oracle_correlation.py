@@ -5,366 +5,378 @@ import sys
 from pathlib import Path
 
 import matplotlib.colors as mcolors
-import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
 import numpy as np
 
-R_GRID = [1, 2, 5, 10, 20, 50, 100, 250, 500, 1000, 5000, 20000]
 COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"]
-REGRET_FORMULA = r"$\mathrm{Regret}(P) = \frac{C(P) - C(P_{\mathrm{oracle}})}{C(P_{\mathrm{oracle}})} \times 100\%$"
-VALUE_FORMULA = r"$\mathrm{Value\ vs\ P_0} = \frac{C(P_0) - C(P_{\mathrm{pred}})}{C(P_{\mathrm{oracle}})} \times 100\%$"
+BW_TICKS = [0.03125, 0.125, 0.5, 2.0, 8.0, 32.0, 128.0, 256.0]
+BW_LABELS = ["32 KB", "128 KB", "512 KB", "2 MB", "8 MB", "32 MB", "128 MB", "256 MB"]
+WAVE_TICKS = [1, 2, 4, 6, 8, 12, 24, 36, 72, 144, 256, 512]
 
 
-def pearson_r(x, y):
-    return float(np.corrcoef(x, y)[0, 1]) if len(x) > 1 else 1.0
+def read_csv_rows(path: Path):
+    with path.open("r", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
 
 
-def mape_pct(pred, real):
-    return float(np.mean(np.abs(pred - real) / np.maximum(1e-9, real)) * 100.0)
+def load_json(path: Path):
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
 
 
-def find_matching_profile(csv_path: Path, tag: str):
-    base = tag.replace("_gelu_cached", "").replace("_relu_cached", "").replace("_cached", "").replace("_vacuum", "")
-    for d in (csv_path.parent, csv_path.parent.parent):
-        cand = d / f"{base}_full.json"
-        if cand.exists():
-            return json.loads(cand.read_text(encoding="utf-8"))
-    return None
-
-
-def draw_phase_panel(ax, grid, ms, ttl, cmap, norm):
-    short = {0: "P0", 1: "P1", 2: "P2", 3: "P3"}
-    ax.imshow(grid, origin="lower", aspect="auto", cmap=cmap, norm=norm)
-    for ri in range(len(R_GRID)):
-        for mi in range(len(ms)):
-            ax.text(mi, ri, short[int(grid[ri, mi])], ha="center", va="center", fontsize=6.0)
-    ax.set_xticks(range(len(ms)))
-    ax.set_xticklabels([str(m) for m in ms], rotation=45, fontsize=6.8)
-    ax.set_yticks(range(len(R_GRID)))
-    ax.set_yticklabels([str(r) for r in R_GRID], fontsize=7.2)
-    ax.set_xlabel("Rows M")
-    ax.set_ylabel("Model Runs R")
-    ax.set_title(ttl, fontsize=9.0)
-
-
-def draw_heat_panel(ax, fig, grid, ms, ttl, cmap_name, norm, cbar_lbl, is_log=False):
-    im = ax.imshow(grid, origin="lower", aspect="auto", cmap=cmap_name, norm=norm)
-    for ri in range(len(R_GRID)):
-        for mi in range(len(ms)):
-            val = float(grid[ri, mi])
-            if abs(val) < 0.05:
-                txt = "0"
-            elif abs(val) < 10.0:
-                txt = f"{val:.1f}"
-            elif abs(val) < 1000.0:
-                txt = f"{val:.0f}"
-            else:
-                txt = f"{val / 1e3:.0f}k"
-            if is_log:
-                col = "white" if val > 0.35 * (norm.vmax ** 0.55) else "#111111"
-            else:
-                span = max(1e-6, norm.vmax - norm.vmin)
-                col = "white" if (val - norm.vmin) > 0.58 * span else "#111111"
-            ax.text(mi, ri, txt, ha="center", va="center", fontsize=5.6, color=col)
-    ax.set_xticks(range(len(ms)))
-    ax.set_xticklabels([str(m) for m in ms], rotation=45, fontsize=6.8)
-    ax.set_yticks(range(len(R_GRID)))
-    ax.set_yticklabels([str(r) for r in R_GRID], fontsize=7.2)
-    ax.set_xlabel("Rows M")
-    ax.set_ylabel("Model Runs R")
-    ax.set_title(ttl, fontsize=8.4)
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.03, label=cbar_lbl)
-
-
-def draw_bench_timings_panel(ax, prof):
-    if not prof or "stage_timings_ms" not in prof:
-        ax.axis("off")
-        ax.text(0.5, 0.5, "No stage_timings_ms in profile JSON", ha="center", va="center")
+def plot_mb1_ols(res_dir: Path, json_files):
+    devs = [(jf.stem.replace("_full", ""), load_json(jf)) for jf in json_files]
+    devs = [(p, m) for p, m in devs if m and "mb1_dispatch" in m]
+    if not devs:
         return
+    fig, axs = plt.subplots(1, len(devs), figsize=(5.6 * len(devs), 4.6), dpi=180, squeeze=False)
+    for idx, (prefix, meta) in enumerate(devs):
+        ax = axs[0, idx]
+        m1 = meta["mb1_dispatch"]
+        t_l = float(m1["t_launch_gpu_us"])
+        t_b = float(m1["t_barrier_gpu_us"])
+        r2 = float(m1.get("r2_dispatch", 1.0))
 
-    st = prof["stage_timings_ms"]
-    stages = [
-        ("Init + MB0 (Warmup)", st.get("init_prng_ms", 0.0) + st.get("mb0_warmup_ms", 0.0), "#4c72b0"),
-        ("MB1 (Dispatch/Barrier)", st.get("mb1_dispatch_ms", 0.0), "#dd8452"),
-        ("MB2 (Cache L1/L2/DRAM)", st.get("mb2_cache_ms", 0.0), "#55a868"),
-        ("MB3 (Stride Coalescing)", st.get("mb3_stride_ms", 0.0), "#c44e52"),
-        ("MB4 (2D GEMM & Tails)", st.get("mb4_tiled_ms", 0.0), "#8172b3"),
-        ("MB5 (FMA/SFU & Waves)", st.get("mb5_compute_ms", 0.0), "#937860"),
-        ("MB6_drv (Vulkan Driver)", st.get("mb6_drv_ms", 0.0), "#da8bc3"),
-        ("MB6_fe (libslang CPU)", st.get("mb6_fe_ms", 0.0), "#8c8c8c"),
-    ]
-    # Show oldest/top first
-    stages = stages[::-1]
-    labels = [s[0] for s in stages]
-    vals = [s[1] for s in stages]
-    cols = [s[2] for s in stages]
-    tot_ms = float(prof.get("calibration_wall_time_ms", sum(vals)))
-    gpu_drv_ms = tot_ms - st.get("mb6_fe_ms", 0.0)
+        pts = m1.get("points", [])
+        if pts:
+            xs = np.array([p[0] for p in pts], float)
+            yn = np.array([p[1] for p in pts], float)
+            yb = np.array([p[2] for p in pts], float)
+            # Recover OLS intercept from centroid
+            b0_n = float(yn.mean() - t_l * xs.mean())
+            b0_b = float(yb.mean() - (t_l + t_b) * xs.mean())
+            ax.scatter(xs, yn, color="#1f77b4", s=46, zorder=4)
+            ax.scatter(xs, yb, color="#d62728", marker="^", s=50, zorder=4)
+        else:
+            xs = np.array([1.0, 8.0, 32.0, 128.0])
+            b0_n = b0_b = 0.0
 
-    y = np.arange(len(stages))
-    bars = ax.barh(y, vals, color=cols, height=0.62, edgecolor="#333333", linewidth=0.5)
-    max_v = max(vals) if vals else 1.0
-    ax.set_xlim(0.0, max_v * 1.28)
-    for b, v in zip(bars, vals):
-        pct = 100.0 * v / max(1e-6, tot_ms)
-        ax.text(v + max_v * 0.015, b.get_y() + b.get_height() / 2.0,
-                f"{v:.1f} ms ({pct:.1f}%)", va="center", ha="left", fontsize=8.2)
+        xl = np.linspace(0.0, 132.0, 100)
+        y_line_n = b0_n + t_l * xl
+        y_line_b = b0_b + (t_l + t_b) * xl
+        ax.plot(xl, y_line_n, color="#1f77b4", lw=2.0, label=f"No Barriers: slope={t_l:.3f} us/dispatch")
+        ax.plot(xl, y_line_b, color="#d62728", lw=2.0, ls="--",
+                label=f"RAW Barriers: slope={t_l+t_b:.3f} us (+{t_b:.3f} us barrier)")
+        ax.fill_between(xl, y_line_n, y_line_b, color="#ff9896", alpha=0.22, label="Cumulative Barrier Tax")
+        ax.set_title(f"{meta['device']['name']}\n(OLS R2 = {r2:.4f})", fontsize=9.5)
+        ax.set_xlabel("Dispatches in Single CommandBuffer (N)")
+        ax.set_ylabel("GPU Execution Time (us)")
+        ax.set_xticks([1, 32, 64, 96, 128])
+        ax.grid(True, ls=":", alpha=0.6)
+        ax.legend(fontsize=7.6, loc="upper left")
 
-    ax.set_yticks(y)
-    ax.set_yticklabels(labels, fontsize=8.4)
-    ax.set_xlabel("Wall Time (ms)")
-    ax.grid(axis="x", ls=":", alpha=0.6)
-    ax.set_title(
-        f"Stage 0 Calibration Breakdown — Total: {tot_ms:.1f} ms ({tot_ms/1e3:.2f} s) "
-        f"| GPU+Driver Only: {gpu_drv_ms:.1f} ms ({gpu_drv_ms/1e3:.2f} s)",
-        fontsize=9.6, fontweight="bold",
-    )
-
-
-def draw_stats_card_panel(ax, prof, tag, r_exec, r_comp, mape_e, agree_p0, agree_p3, agree_pred,
-                          summary_stats, mean_val, max_val, m_count, n_val, k_val):
-    ax.axis("off")
-    lines = []
-    if prof:
-        d = prof["device"]
-        m1 = prof["mb1_dispatch"]
-        m2 = prof["mb2_memory"]
-        m3 = prof["mb3_coalescing"]
-        m4 = prof["mb4_tiling"]
-        m5 = prof["mb5_compute"]
-        m6 = prof["mb6_compile"]
-        topo = "Unified UMA" if d["is_integrated_uma"] else "Desktop Discrete"
-        lines.append(f"DEVICE   : {d['name']} ({d['driver']}) | {topo} | Subgroup={d['subgroup_size']} | SMEM={d['max_shared_mem_bytes']//1024} KB")
-        lines.append(
-            f"MB1-MB3  : t_submit={m1['t_submit_cpu_us']:.1f}us | t_launch={m1['t_launch_gpu_us']:.2f}us | t_bar={m1['t_barrier_gpu_us']:.2f}us (R2={m1['r2_dispatch']:.3f}) | "
-            f"L2={m2['l2_effective_mb']:.2f}MB | BW_L2={m2['bw_l2_gbps']:.1f} | BW_DRAM={m2['bw_dram_gbps']:.1f} GB/s | coal32={m3['coal_factor_dram_s32']:.3f}"
-        )
-        lines.append(
-            f"MB4-MB5  : Tiled SMEM={m4['gflops_matmul_smem']:.1f} vs Cache={m4['gflops_matmul_cache']:.1f} GFLOPS | tail_eff={m4['tail_efficiency']:.3f} | "
-            f"Peak FMA={m5['pi_fma_gflops']:.1f} GFLOPS | GELU_ERF={m5['pi_gelu_erf_gelem_s']:.2f} GElem/s | G_wave={m5['g_wave_quantum']} WGs"
-        )
-        smem_str = ""
-        if m6.get("r2_drv", 1.0) < 0.95 and m6.get("beta_1_drv_smem_ms_per_word", 0.0) > 0.0:
-            smem_str = f" | SMEM_mode: b1={m6['beta_1_drv_smem_ms_per_word']*1e3:.1f}us/w"
-        lines.append(
-            f"MB6 OLS  : Drv b0={m6['beta_0_drv_ms']:.2f}ms, b1={m6['beta_1_drv_ms_per_word']*1e3:.2f}us/w (R2={m6['r2_drv']:.4f}){smem_str} | "
-            f"Slang a1={m6['alpha_1_slang_ms_per_word']*1e3:.1f}us/w (R2={m6['r2_fe_slang']:.3f}) | hit={m6['t_cache_hit_ms']:.4f}ms"
-        )
-    else:
-        lines.append(f"DEVICE   : {tag}")
-
-    lines.append("-" * 116)
-    lines.append(
-        f"ORACLE   : {m_count}x{len(R_GRID)}={m_count*len(R_GRID)} tasks (N={n_val}, K={k_val}) | "
-        f"T_exec Pearson r={r_exec:.5f} (R2={r_exec**2:.5f}), MAPE={mape_e:.2f}% | T_comp r={r_comp:.5f}"
-    )
-    lines.append(
-        f"DECISION : Agreement: All-P0={agree_p0:.1f}%, All-P3={agree_p3:.1f}% -> UniversalCostEngine={agree_pred:.1f}% | "
-        f"Net Value vs P0: Mean=+{mean_val:.2f}%, Max=+{max_val:.1f}%"
-    )
-    lines.append(
-        f"REGRET   : Proposed={summary_stats['Proposed: UniversalCostEngine']:.3f}%  ||  "
-        f"Fixed: All-P0={summary_stats['Fixed: Always Split (P0)']:.3f}%, P2={summary_stats['Fixed: Always Partial (P2)']:.2f}%, "
-        f"All-P3={summary_stats['Fixed: Always Fuse (P3)']:.1f}%"
-    )
-    lines.append(
-        f"ABLATIONS: NoMemoryTraffic={summary_stats['Ablation: NoMemoryTraffic']:.3f}% | "
-        f"NoDispatch={summary_stats['Ablation: NoDispatch']:.3f}% | "
-        f"NoCompileCost={summary_stats['Ablation: NoCompileCost']:.1f}%"
-    )
-
-    box_text = "\n".join(lines)
-    ax.text(
-        0.01, 0.94, box_text, transform=ax.transAxes, va="top", ha="left",
-        family="monospace", fontsize=7.9, linespacing=1.45,
-        bbox=dict(boxstyle="round,pad=0.6", facecolor="#f7f9fc", edgecolor="#9aa8b8", linewidth=1.0),
-    )
-    ax.set_title("Calibrated Hardware Profile & Blind Oracle Verification Summary", fontsize=9.6, fontweight="bold")
-
-
-def analyze_file(csv_path: Path, out_dir: Path):
-    tag = csv_path.stem.replace("verify_", "")
-    prof = find_matching_profile(csv_path, tag)
-    with csv_path.open("r", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
-
-    n_val, k_val = int(rows[0]["N"]), int(rows[0]["K"])
-    pred_e = np.array([float(r["pred_exec_us"]) for r in rows])
-    real_e = np.array([float(r["real_exec_us"]) for r in rows])
-    pred_c = np.array([float(r["pred_compile_us"]) for r in rows])
-    real_c = np.array([float(r["real_compile_us"]) for r in rows])
-
-    r_exec, mape_e = pearson_r(pred_e, real_e), mape_pct(pred_e, real_e)
-    r_comp, mape_c = pearson_r(pred_c, real_c), mape_pct(pred_c, real_c)
-
-    ms = sorted({int(r["M"]) for r in rows})
-    by_m = {m: {} for m in ms}
-    for r in rows:
-        m, p = int(r["M"]), int(r["plan_id"])
-        by_m[m][p] = {
-            "pc": float(r["pred_compile_us"]), "rc": float(r["real_compile_us"]),
-            "pe": float(r["pred_exec_us"]), "re": float(r["real_exec_us"]),
-            "nomem_e": float(r["pred_nomem_exec_us"]), "nodisp_e": float(r["pred_nodisp_exec_us"]),
-        }
-
-    grid_p0 = np.zeros((len(R_GRID), len(ms)), dtype=int)
-    grid_p3 = np.full((len(R_GRID), len(ms)), 3, dtype=int)
-    grid_pred = np.zeros((len(R_GRID), len(ms)), dtype=int)
-    grid_real = np.zeros((len(R_GRID), len(ms)), dtype=int)
-
-    grid_reg_p0 = np.zeros((len(R_GRID), len(ms)), dtype=float)
-    grid_reg_p3 = np.zeros((len(R_GRID), len(ms)), dtype=float)
-    grid_reg_pred = np.zeros((len(R_GRID), len(ms)), dtype=float)
-    grid_net_value = np.zeros((len(R_GRID), len(ms)), dtype=float)
-
-    policies = {
-        "Fixed: Always Split (P0)": [], "Fixed: Always Partial (P2)": [], "Fixed: Always Fuse (P3)": [],
-        "Ablation: NoMemoryTraffic": [], "Ablation: NoDispatch": [], "Ablation: NoCompileCost": [],
-        "Proposed: UniversalCostEngine": [],
-    }
-
-    matches_pred, matches_p0, matches_p3 = 0, 0, 0
-    for mi, m in enumerate(ms):
-        d = by_m[m]
-        for ri, rv in enumerate(R_GRID):
-            real_cost = {p: d[p]["rc"] + rv * d[p]["re"] for p in range(4)}
-            oracle_p = min(range(4), key=lambda p: real_cost[p])
-            oracle_c = real_cost[oracle_p]
-
-            full_p = min(range(4), key=lambda p: d[p]["pc"] + rv * d[p]["pe"])
-            nomem_p = min(range(4), key=lambda p: d[p]["pc"] + rv * d[p]["nomem_e"])
-            nodisp_p = min(range(4), key=lambda p: d[p]["pc"] + rv * d[p]["nodisp_e"])
-            nocomp_p = min(range(4), key=lambda p: rv * d[p]["pe"])
-
-            calc_reg = lambda chosen: (real_cost[chosen] - oracle_c) / oracle_c * 100.0
-            reg_p0, reg_p3, reg_pred = calc_reg(0), calc_reg(3), calc_reg(full_p)
-
-            grid_real[ri, mi], grid_pred[ri, mi] = oracle_p, full_p
-            grid_reg_p0[ri, mi], grid_reg_p3[ri, mi], grid_reg_pred[ri, mi] = reg_p0, reg_p3, reg_pred
-            grid_net_value[ri, mi] = reg_p0 - reg_pred
-
-            if full_p == oracle_p: matches_pred += 1
-            if oracle_p == 0: matches_p0 += 1
-            if oracle_p == 3: matches_p3 += 1
-
-            policies["Fixed: Always Split (P0)"].append(reg_p0)
-            policies["Fixed: Always Partial (P2)"].append(calc_reg(2))
-            policies["Fixed: Always Fuse (P3)"].append(reg_p3)
-            policies["Ablation: NoMemoryTraffic"].append(calc_reg(nomem_p))
-            policies["Ablation: NoDispatch"].append(calc_reg(nodisp_p))
-            policies["Ablation: NoCompileCost"].append(calc_reg(nocomp_p))
-            policies["Proposed: UniversalCostEngine"].append(reg_pred)
-
-    tot = len(ms) * len(R_GRID)
-    agree_pred, agree_p0, agree_p3 = matches_pred / tot * 100.0, matches_p0 / tot * 100.0, matches_p3 / tot * 100.0
-    mean_p0, max_p0 = float(np.mean(grid_reg_p0)), float(np.max(grid_reg_p0))
-    mean_p3, max_p3 = float(np.mean(grid_reg_p3)), float(np.max(grid_reg_p3))
-    mean_pr, max_pr = float(np.mean(grid_reg_pred)), float(np.max(grid_reg_pred))
-    mean_val, max_val = float(np.mean(grid_net_value)), float(np.max(grid_net_value))
-
-    print(f"\n==================== [{tag}] IDENTICAL-CONDITION VULKAN 1.3 VERIFICATION ====================")
-    print(f"T_execute Correlation : Pearson r = {r_exec:.5f} (R2 = {r_exec**2:.5f}) | MAPE = {mape_e:.2f}%")
-    print(f"T_compile Correlation : Pearson r = {r_comp:.5f} | MAPE = {mape_c:.2f}%")
-    print(f"Phase Map Agreement   : All-P0 = {agree_p0:.1f}% | All-P3 = {agree_p3:.1f}% -> CostModel = {agree_pred:.1f}%")
-    summary_stats = {}
-    for name, regs in policies.items():
-        arr = np.array(regs)
-        summary_stats[name] = float(np.mean(arr))
-        print(f"  {name:<32} Mean={np.mean(arr):>9.3f}% | P95={np.percentile(arr, 95):>9.3f}% | Max={np.max(arr):>9.3f}%")
-
-    # 3-row presentation card (4 cols):
-    # Row 0: Phase Maps (All P0 | All P3 | CostModel | Oracle)
-    # Row 1: Heatmaps   (All P0 Regret | All P3 Regret | CostModel Regret | Net Value vs P0)
-    # Row 2: [0:2] Microbenchmark Stage Timings | [2:4] Device Profile & Verification Summary Card
-    fig = plt.figure(figsize=(23.0, 13.4), dpi=170)
-    gs = gridspec.GridSpec(3, 4, figure=fig, height_ratios=[1.0, 1.0, 0.72])
-
-    cmap_p = mcolors.ListedColormap(["#6baed6", "#fdae6b", "#fd8d3c", "#74c476"])
-    norm_p = mcolors.BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5], cmap_p.N)
-
-    draw_phase_panel(fig.add_subplot(gs[0, 0]), grid_p0, ms, f"1. Fixed: Always Split (All P0)\nAgreement = {agree_p0:.1f}%", cmap_p, norm_p)
-    draw_phase_panel(fig.add_subplot(gs[0, 1]), grid_p3, ms, f"2. Fixed: Always Fuse (All P3)\nAgreement = {agree_p3:.1f}%", cmap_p, norm_p)
-    draw_phase_panel(fig.add_subplot(gs[0, 2]), grid_pred, ms, f"3. Proposed: UniversalCostEngine\nAgreement = {agree_pred:.1f}%", cmap_p, norm_p)
-    draw_phase_panel(fig.add_subplot(gs[0, 3]), grid_real, ms, "4. Measured Hardware Oracle\nGround-Truth Optimal P*", cmap_p, norm_p)
-
-    shared_vmax = max(5.0, max_p0, max_pr)
-    norm_lin = mcolors.Normalize(vmin=0.0, vmax=shared_vmax)
-    norm_p3_log = mcolors.SymLogNorm(linthresh=1.0, vmin=0.0, vmax=max(10.0, max_p3))
-
-    draw_heat_panel(fig.add_subplot(gs[1, 0]), fig, grid_reg_p0, ms,
-                    f"5. All-P0 Regret: Mean={mean_p0:.2f}%, Max={max_p0:.1f}%\n" + REGRET_FORMULA,
-                    "YlOrRd", norm_lin, "Regret vs Oracle (%)")
-    draw_heat_panel(fig.add_subplot(gs[1, 1]), fig, grid_reg_p3, ms,
-                    f"6. All-P3 Regret (Log): Mean={mean_p3:.0f}%, Max={max_p3:.0f}%\n" + REGRET_FORMULA,
-                    "YlOrRd", norm_p3_log, "Regret (%, log scale)", is_log=True)
-    draw_heat_panel(fig.add_subplot(gs[1, 2]), fig, grid_reg_pred, ms,
-                    f"7. CostModel Regret: Mean={mean_pr:.2f}%, Max={max_pr:.1f}%\n" + REGRET_FORMULA,
-                    "YlOrRd", norm_lin, "Regret vs Oracle (%)")
-    draw_heat_panel(fig.add_subplot(gs[1, 3]), fig, grid_net_value, ms,
-                    f"8. Net Value vs All-P0: Mean=+{mean_val:.2f}%, Max=+{max_val:.1f}%\n" + VALUE_FORMULA,
-                    "YlGn", norm_lin, "Savings vs P0 (%)")
-
-    draw_bench_timings_panel(fig.add_subplot(gs[2, 0:2]), prof)
-    draw_stats_card_panel(fig.add_subplot(gs[2, 2:4]), prof, tag, r_exec, r_comp, mape_e,
-                          agree_p0, agree_p3, agree_pred, summary_stats, mean_val, max_val, len(ms), n_val, k_val)
-
-    fig.suptitle(
-        f"[{tag}] All-P0 vs All-P3 vs UniversalCostEngine vs Vulkan 1.3 Oracle "
-        f"(Pearson r={r_exec:.4f}, MAPE={mape_e:.1f}%, N={n_val}, K={k_val})", fontsize=13.0, fontweight="bold"
-    )
-    fig.tight_layout(rect=[0, 0, 1, 0.97])
-    out_p = out_dir / f"compare_phase_MR_{tag}.png"
+    fig.suptitle("MB1: OLS Linear Regression for GPU Kernel Launch & RAW Barrier Cost (N = 1..128)", fontsize=11.5)
+    fig.tight_layout()
+    out_p = res_dir / "mb1_dispatch_ols.png"
     fig.savefig(out_p)
     plt.close(fig)
     print(f"Saved -> {out_p}")
-    return tag, pred_e, real_e, r_exec, mape_e, summary_stats
+
+
+def plot_bw(res_dir: Path, bw_files, log_y: bool):
+    fig, ax = plt.subplots(figsize=(9.0, 5.2), dpi=180)
+    for idx, bf in enumerate(bw_files):
+        prefix = bf.stem.replace("_bw", "")
+        meta = load_json(res_dir / f"{prefix}_full.json")
+        c = COLORS[idx % len(COLORS)]
+        rows = read_csv_rows(bf)
+        xs = [float(r["working_set_mb"]) for r in rows]
+        ys = [float(r["bw_median_gbps"]) for r in rows]
+        iqrs = [float(r["bw_iqr_gbps"]) for r in rows]
+        ax.plot(xs, ys, marker="o", lw=2.0, ms=4.5, color=c, label=meta["device"]["name"] if meta else prefix)
+        if not log_y:
+            ax.fill_between(xs, [max(0.0, y - 0.5 * q) for y, q in zip(ys, iqrs)],
+                            [y + 0.5 * q for y, q in zip(ys, iqrs)], color=c, alpha=0.15)
+        if meta and "mb2_memory" in meta:
+            l2 = float(meta["mb2_memory"]["l2_effective_mb"])
+            if l2 > 0:
+                ax.axvline(l2, color=c, ls="--", lw=1.3, alpha=0.8, label=f"{prefix}: L2={l2:g}MB")
+    ax.set_xscale("log", base=2)
+    if log_y:
+        ax.set_yscale("log", base=10)
+    ax.set_xticks(BW_TICKS)
+    ax.set_xticklabels(BW_LABELS)
+    ax.set_xlabel("Working Set Size W")
+    ax.set_ylabel("Effective Read Bandwidth (GB/s" + (", log10)" if log_y else ")"))
+    ax.set_title("MB2: Cross-Vendor Cache Hierarchy" + (" (Log-Log)" if log_y else ""))
+    ax.grid(True, which="both", ls=":", alpha=0.6)
+    ax.legend(fontsize=8.0, loc="lower left" if log_y else "upper right")
+    fig.tight_layout()
+    out_p = res_dir / ("mb2_cache_hierarchy_log.png" if log_y else "mb2_cache_hierarchy.png")
+    fig.savefig(out_p)
+    plt.close(fig)
+    print(f"Saved -> {out_p}")
+
+
+def plot_mb3_mb4_abs(res_dir: Path, json_files):
+    devs = [(jf.stem.replace("_full", ""), load_json(jf)) for jf in json_files]
+    devs = [(p, m) for p, m in devs if m]
+    if not devs:
+        return
+    names, x, w = [p for p, _ in devs], np.arange(len(devs)), 0.25
+    fig, (ax3, ax4) = plt.subplots(1, 2, figsize=(12.0, 4.7), dpi=180)
+
+    ax3.bar(x - w, [m["mb2_memory"]["bw_dram_gbps"] for _, m in devs], w, label="DRAM Coalesced (stride=1)")
+    ax3.bar(x, [m["mb3_coalescing"]["bw_l2_strided32_gbps"] for _, m in devs], w, label="L2 Strided (stride=32)")
+    ax3.bar(x + w, [m["mb3_coalescing"]["bw_dram_strided32_gbps"] for _, m in devs], w, label="DRAM Strided (stride=32)")
+    ax3.set_yscale("log", base=10)
+    ax3.set_xticks(x)
+    ax3.set_xticklabels(names)
+    ax3.set_ylabel("Useful Bandwidth (GB/s, log10)")
+    ax3.set_title("MB3: Coalesced vs Strided (128B) Memory Bandwidth")
+    ax3.grid(axis="y", which="both", ls=":", alpha=0.6)
+    ax3.legend(fontsize=8.0)
+
+    ax4.bar(x - w, [m["mb5_compute"]["pi_fma_gflops"] for _, m in devs], w, label="Peak FMA16 (MB5)")
+    ax4.bar(x, [m["mb4_tiling"]["gflops_matmul_smem"] for _, m in devs], w, label="Tiled 64x64 SMEM (MB4)")
+    ax4.bar(x + w, [m["mb4_tiling"]["gflops_matmul_cache"] for _, m in devs], w, label="Tiled 64x64 DirectCache (MB4)")
+    ax4.set_yscale("log", base=10)
+    ax4.set_xticks(x)
+    ax4.set_xticklabels(names)
+    ax4.set_ylabel("Sustained FP32 Throughput (GFLOPS, log10)")
+    ax4.set_title("MB4 & MB5: Peak FMA vs 2D-Tiled GEMM (SMEM vs Cache)")
+    ax4.grid(axis="y", which="both", ls=":", alpha=0.6)
+    ax4.legend(fontsize=8.0)
+
+    fig.tight_layout()
+    out_p = res_dir / "mb3_mb4_abs.png"
+    fig.savefig(out_p)
+    plt.close(fig)
+    print(f"Saved -> {out_p}")
+
+
+def plot_waves(res_dir: Path, wave_files):
+    fig, (ax_t, ax_b) = plt.subplots(2, 1, figsize=(9.0, 6.6), dpi=180, sharex=True)
+    fig_n, ax_n = plt.subplots(figsize=(9.0, 4.8), dpi=180)
+    max_t = 10.0
+    for idx, wf in enumerate(wave_files):
+        prefix = wf.stem.replace("_wave", "")
+        meta = load_json(res_dir / f"{prefix}_full.json")
+        c = COLORS[idx % len(COLORS)]
+        rows = read_csv_rows(wf)
+        xs = [int(r["workgroups"]) for r in rows]
+        gfs = [float(r["gflops"]) for r in rows]
+        ts = [float(r["gpu_time_us"]) for r in rows]
+        peak = max(gfs) if gfs else 1.0
+        for x_v, t in zip(xs, ts):
+            if x_v <= 36:
+                max_t = max(max_t, t)
+        lbl = meta["device"]["name"] if meta else prefix
+        ax_t.plot(xs, [g / 1e3 for g in gfs], marker="s", lw=2.0, ms=4.2, color=c, label=lbl)
+        ax_b.plot(xs, ts, marker="o", lw=1.9, ms=4.0, color=c, label=lbl)
+        ax_n.plot(xs, [100.0 * g / peak for g in gfs], marker="s", lw=2.0, ms=4.2, color=c, label=lbl)
+        if meta and "mb5_compute" in meta:
+            gw = int(meta["mb5_compute"].get("g_wave_quantum", 0))
+            if gw > 1:
+                ax_n.axvline(gw, color=c, ls="--", lw=1.3, alpha=0.75, label=f"{prefix}: G_wave={gw}")
+                for m in (1, 2, 3):
+                    if gw * m <= max(xs):
+                        ax_t.axvline(gw * m, color=c, ls="--", lw=1.1, alpha=0.55,
+                                     label=(f"{prefix}: G_wave={gw}" if m == 1 else None))
+                        ax_b.axvline(gw * m, color=c, ls="--", lw=1.1, alpha=0.55)
+    ax_t.set_xscale("log", base=2)
+    ax_t.set_ylabel("Sustained FP32 (TFLOPS)")
+    ax_t.set_title("MB5: Wave Saturation & Quantization Staircase")
+    ax_t.grid(True, which="both", ls=":", alpha=0.6)
+    ax_t.legend(fontsize=8.0, loc="upper left")
+    ax_b.set_xticks(WAVE_TICKS)
+    ax_b.set_xticklabels([str(v) for v in WAVE_TICKS])
+    ax_b.set_ylim(0.0, max_t * 1.18)
+    ax_b.set_xlabel("Launched Workgroups G (256 threads/WG)")
+    ax_b.set_ylabel("Time (us, G<=36)")
+    ax_b.grid(True, which="both", ls=":", alpha=0.6)
+    fig.tight_layout()
+    fig.savefig(res_dir / "mb5_wave_saturation.png")
+    plt.close(fig)
+
+    ax_n.set_xscale("log", base=2)
+    ax_n.set_xticks(WAVE_TICKS)
+    ax_n.set_xticklabels([str(v) for v in WAVE_TICKS])
+    ax_n.set_ylim(0.0, 108.0)
+    ax_n.set_xlabel("Launched Workgroups G (256 threads/WG)")
+    ax_n.set_ylabel("Utilization (% of Device Peak)")
+    ax_n.set_title("MB5: Cross-Vendor Wave Quantization (% of Peak)")
+    ax_n.grid(True, which="both", ls=":", alpha=0.6)
+    ax_n.legend(fontsize=8.0, loc="lower right")
+    fig_n.tight_layout()
+    fig_n.savefig(res_dir / "mb5_wave_efficiency_norm.png")
+    plt.close(fig_n)
+    print(f"Saved -> {res_dir / 'mb5_wave_saturation.png'} & mb5_wave_efficiency_norm.png")
+
+
+def plot_mb6_ols(res_dir: Path, json_files):
+    valid = [(jf.stem.replace("_full", ""), load_json(jf)) for jf in json_files]
+    valid = [(p, m) for p, m in valid if m and m.get("mb6_compile", {}).get("drv_points")]
+    if not valid:
+        return
+
+    # 2x2 grid: individual scaled OLS plot per device driver + libslang frontend OLS panel
+    n_panels = len(valid) + 1
+    ncols = 2
+    nrows = (n_panels + 1) // 2
+    fig, axs = plt.subplots(nrows, ncols, figsize=(12.2, 4.6 * nrows), dpi=180, squeeze=False)
+    flat_axs = [axs[r, c] for r in range(nrows) for c in range(ncols)]
+
+    for idx, (prefix, meta) in enumerate(valid):
+        ax = flat_axs[idx]
+        c = COLORS[idx % len(COLORS)]
+        m6 = meta["mb6_compile"]
+        pts = m6["drv_points"]
+        xs = np.array([p[0] for p in pts], float)
+        ys = np.array([p[1] for p in pts], float)
+        r2 = float(m6["r2_drv"])
+        b0, b1 = float(m6["beta_0_drv_ms"]), float(m6["beta_1_drv_ms_per_word"])
+
+        if r2 < 0.95 and m6.get("beta_1_drv_smem_ms_per_word", 0.0) > 0.0:
+            # Two-regime OLS triggered by R2 < 0.95 (e.g. RPi4 V3D CFG/SMEM cliff)
+            b0_sm, b1_sm = float(m6["beta_0_drv_smem_ms"]), float(m6["beta_1_drv_smem_ms_per_word"])
+            ax.scatter(xs[:4], ys[:4], color="#1f77b4", s=48, zorder=4, label="Regime 1: 1D / Direct (no SMEM)")
+            ax.scatter(xs[4:], ys[4:], color="#d62728", marker="D", s=48, zorder=4, label="Regime 2: Unrolled 2D SMEM")
+            xl1 = np.linspace(0, xs[3] * 1.15, 50)
+            xl2 = np.linspace(xs[4] * 0.92, xs[-1] * 1.05, 50)
+            ax.plot(xl1, np.maximum(0.1, b0 + b1 * xl1), color="#1f77b4", lw=2.0,
+                    label=f"OLS1: b0={b0:.2f}ms, b1={b1*1e3:.2f}us/w")
+            ax.plot(xl2, np.maximum(0.1, b0_sm + b1_sm * xl2), color="#d62728", lw=2.0, ls="--",
+                    label=f"OLS2: {b0_sm + b1_sm * xs[4]:.0f}ms plateau")
+            ax.set_yscale("log", base=10)
+            ax.set_ylabel("Compile Time (ms, log10)")
+            ax.set_title(f"MB6 Driver OLS: {meta['device']['name']}\n(Two-Regime triggered: global R2={r2:.3f} < 0.95)", fontsize=9.5)
+        else:
+            xl = np.linspace(0, max(xs) * 1.05, 100)
+            ax.scatter(xs, ys, color=c, s=48, zorder=4, label="Measured (median N=7 salted)")
+            ax.plot(xl, b0 + b1 * xl, color=c, lw=2.0,
+                    label=f"OLS: T = {b0:.2f} + {b1*1e3:.3f}e-3 * L (R2={r2:.4f})")
+            ax.set_ylabel("Compile Time (ms)")
+            ax.set_title(f"MB6 Driver OLS: {meta['device']['name']} (R2={r2:.4f})", fontsize=9.5)
+
+        ax.set_xlabel("SPIR-V Module Length L_spv (32-bit words)")
+        ax.grid(True, which="both", ls=":", alpha=0.6)
+        ax.legend(fontsize=7.8, loc="upper left")
+
+    # Last panel: Frontend libslang OLS
+    ax_fe = flat_axs[len(valid)]
+    has_fe = False
+    for idx, (prefix, meta) in enumerate(valid):
+        m6 = meta["mb6_compile"]
+        fe_pts = m6.get("fe_points", [])
+        if fe_pts:
+            has_fe = True
+            c = COLORS[idx % len(COLORS)]
+            fxs = np.array([p[0] for p in fe_pts], float)
+            fys = np.array([p[1] for p in fe_pts], float)
+            xl = np.linspace(0, max(fxs) * 1.05, 100)
+            a0, a1, r2f = m6["alpha_0_slang_ms"], m6["alpha_1_slang_ms_per_word"], m6["r2_fe_slang"]
+            ax_fe.scatter(fxs, fys, color=c, s=44, zorder=4)
+            ax_fe.plot(xl, a0 + a1 * xl, color=c, lw=2.0,
+                       label=f"{prefix}: a1={a1*1e3:.2f} us/w (R2={r2f:.3f})")
+    if has_fe:
+        ax_fe.set_title("MB6 Frontend OLS: In-Process libslang (Slang -> SPIR-V)", fontsize=9.5)
+        ax_fe.set_xlabel("SPIR-V Module Length L_spv (32-bit words)")
+        ax_fe.set_ylabel("Frontend Compile Time (ms)")
+        ax_fe.grid(True, ls=":", alpha=0.6)
+        ax_fe.legend(fontsize=8.0, loc="upper left")
+    else:
+        ax_fe.axis("off")
+
+    for k in range(len(valid) + 1, len(flat_axs)):
+        flat_axs[k].axis("off")
+
+    fig.suptitle("MB6: Ordinary Least Squares (OLS) Compilation Cost Calibration", fontsize=12.0)
+    fig.tight_layout()
+    out_p = res_dir / "mb6_compile_ols.png"
+    fig.savefig(out_p)
+    plt.close(fig)
+    print(f"Saved -> {out_p}")
+
+
+def plot_dashboard(res_dir: Path, json_files):
+    devs = [(jf.stem.replace("_full", ""), load_json(jf)) for jf in json_files]
+    devs = [(p, m) for p, m in devs if m]
+    if not devs:
+        return
+    names, x, w = [p for p, _ in devs], np.arange(len(devs)), 0.25
+    fig, axs = plt.subplots(2, 2, figsize=(11.5, 7.0), dpi=180)
+
+    ax = axs[0, 0]
+    ax.bar(x - w / 2, [m["mb1_dispatch"]["t_launch_gpu_us"] for _, m in devs], w, label="t_launch (us)")
+    ax.bar(x + w / 2, [m["mb1_dispatch"]["t_barrier_gpu_us"] for _, m in devs], w, label="t_barrier (us)")
+    ax.set_xticks(x); ax.set_xticklabels(names); ax.set_title("MB1: GPU Launch & RAW Barrier"); ax.legend(fontsize=8.0); ax.grid(axis="y", ls=":", alpha=0.6)
+
+    ax = axs[0, 1]
+    ax.bar(x - w / 2, [m["mb3_coalescing"]["coal_factor_l2_s32"] for _, m in devs], w, label="L2 Stride=32")
+    ax.bar(x + w / 2, [m["mb3_coalescing"]["coal_factor_dram_s32"] for _, m in devs], w, label="DRAM Stride=32")
+    ax.set_xticks(x); ax.set_xticklabels(names); ax.set_title("MB3: Coalescing Efficiency"); ax.legend(fontsize=8.0); ax.grid(axis="y", ls=":", alpha=0.6)
+
+    ax = axs[1, 0]
+    ax.bar(x - w, [m["mb4_tiling"].get("smem_vs_cache_speedup", 1.0) for _, m in devs], w, label="SMEM/Cache")
+    ax.bar(x, [m["mb4_tiling"].get("tail_efficiency", 1.0) for _, m in devs], w, label="tail_eff")
+    ax.bar(x + w, [m["mb4_tiling"].get("fusion_reg_factor", 1.0) for _, m in devs], w, label="fusion_reg")
+    ax.axhline(1.0, color="k", ls="--", lw=0.9, alpha=0.5)
+    ax.set_xticks(x); ax.set_xticklabels(names); ax.set_title("MB4: Tiling, Tail & Reg Pressure"); ax.legend(fontsize=8.0); ax.grid(axis="y", ls=":", alpha=0.6)
+
+    ax = axs[1, 1]
+    v2 = [(p, m) for p, m in devs if "stage_timings_ms" in m]
+    if v2:
+        keys = ["mb0_warmup_ms", "mb1_dispatch_ms", "mb2_cache_ms", "mb3_stride_ms", "mb4_tiled_ms", "mb5_compute_ms", "mb6_drv_ms", "mb6_fe_ms"]
+        lbls = ["MB0", "MB1", "MB2", "MB3", "MB4", "MB5", "MB6_drv", "MB6_fe"]
+        y, left = np.arange(len(v2)), np.zeros(len(v2))
+        for k, l in zip(keys, lbls):
+            vals = np.array([m["stage_timings_ms"].get(k, 0.0) for _, m in v2])
+            ax.barh(y, vals, left=left, height=0.45, label=l); left += vals
+        ax.set_yticks(y); ax.set_yticklabels([p for p, _ in v2]); ax.set_xlabel("Wall Time (ms)")
+        ax.set_title("Stage 0 Calibration Time Breakdown"); ax.legend(fontsize=7.2, ncol=2); ax.grid(axis="x", ls=":", alpha=0.6)
+    else:
+        ax.axis("off")
+
+    fig.tight_layout(); fig.savefig(res_dir / "mb_dashboard.png"); plt.close(fig)
+    print(f"Saved -> {res_dir / 'mb_dashboard.png'}")
+
+
+def plot_phase_maps(res_dir: Path, phase_files):
+    if not phase_files:
+        return
+    fig, axs = plt.subplots(1, len(phase_files), figsize=(6.2 * len(phase_files), 4.8), dpi=180, squeeze=False)
+    cmap = mcolors.ListedColormap(["#6baed6", "#fdae6b", "#fd8d3c", "#74c476"])
+    norm = mcolors.BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5], cmap.N)
+    short = {0: "P0", 1: "P1", 2: "P2", 3: "P3"}
+    for idx, pf in enumerate(phase_files):
+        ax, prefix = axs[0, idx], pf.stem.replace("_phase_MR", "")
+        meta, rows = load_json(res_dir / f"{prefix}_full.json"), read_csv_rows(pf)
+        ms, rs = sorted({int(r["M"]) for r in rows}), sorted({int(r["R"]) for r in rows})
+        grid = np.zeros((len(rs), len(ms)), dtype=int)
+        for r in rows:
+            grid[rs.index(int(r["R"])), ms.index(int(r["M"]))] = int(r["plan_id"])
+        ax.imshow(grid, origin="lower", aspect="auto", cmap=cmap, norm=norm)
+        for ri in range(len(rs)):
+            for mi in range(len(ms)):
+                ax.text(mi, ri, short[grid[ri, mi]], ha="center", va="center", fontsize=6.8)
+        ax.set_xticks(range(len(ms))); ax.set_xticklabels([str(m) for m in ms], rotation=45, fontsize=7.5)
+        ax.set_yticks(range(len(rs))); ax.set_yticklabels([str(r) for r in rs], fontsize=8.0)
+        ax.set_xlabel("Rows M (N=3072, K=768, ReLU, cached)"); ax.set_ylabel("Model Runs R")
+        title = meta["device"]["name"] if meta else prefix
+        if meta and "mb2_memory" in meta:
+            title += f"\n(L2 cliff M_L2 ~= {float(meta['mb2_memory']['l2_effective_bytes']) / (4.0 * 3072.0):.0f})"
+        ax.set_title(title, fontsize=9.5)
+    fig.suptitle("2D Decision Phase Map in (M, R): P0=Split | P2=FusedEpilogue | P3=FullFusion", fontsize=11)
+    fig.tight_layout(); fig.savefig(res_dir / "phase_map_MR.png"); plt.close(fig)
+    print(f"Saved -> {res_dir / 'phase_map_MR.png'}")
 
 
 def main():
-    res_dir = Path(sys.argv[1]) if len(sys.argv[1:]) >= 1 else Path("results")
-    vfiles = sorted(res_dir.glob("verify_*.csv"))
-    if not vfiles:
-        sys.exit(f"No verify_*.csv found in {res_dir}")
-    fig_s, ax_s = plt.subplots(figsize=(6.8, 5.6), dpi=180)
-    lo_all, hi_all, all_stats = 1e9, 0.0, []
-    for idx, vf in enumerate(vfiles):
-        tag, pe, re_v, r_val, mp, st = analyze_file(vf, res_dir)
-        all_stats.append((tag, st))
-        c = COLORS[idx % len(COLORS)]
-        ax_s.scatter(re_v, pe, color=c, s=32, alpha=0.82, label=f"{tag}: r={r_val:.4f}, MAPE={mp:.1f}%")
-        lo_all, hi_all = min(lo_all, re_v.min(), pe.min()), max(hi_all, re_v.max(), pe.max())
-    ax_s.plot([lo_all * 0.8, hi_all * 1.2], [lo_all * 0.8, hi_all * 1.2], "k--", lw=1.4, label="Ideal y = x")
-    ax_s.set_xscale("log", base=10)
-    ax_s.set_yscale("log", base=10)
-    ax_s.set_xlabel("Measured Vulkan 1.3 Execution Time (us)")
-    ax_s.set_ylabel("Predicted Time (us)")
-    ax_s.set_title("Blind Prediction vs Real Hardware Execution (P0..P3, M=16..4096)")
-    ax_s.grid(True, which="both", ls=":", alpha=0.6)
-    ax_s.legend(fontsize=8.5)
-    fig_s.tight_layout()
-    fig_s.savefig(res_dir / "corr_pred_vs_meas.png")
-    plt.close(fig_s)
-
-    if all_stats:
-        pol_names = list(all_stats[0][1].keys())
-        x, w = np.arange(len(pol_names)), 0.36 / max(1, len(all_stats) / 2)
-        fig_b, ax_b = plt.subplots(figsize=(10.5, 5.2), dpi=180)
-        for idx, (tag, st) in enumerate(all_stats):
-            vals = [max(0.01, st[k]) for k in pol_names]
-            bars = ax_b.bar(x + (idx - (len(all_stats) - 1) / 2.0) * w, vals, w, color=COLORS[idx % len(COLORS)], label=tag)
-            for b, rv in zip(bars, [st[k] for k in pol_names]):
-                ax_b.text(b.get_x() + b.get_width() / 2.0, b.get_height() * 1.08, f"{rv:.2f}%",
-                          ha="center", va="bottom", fontsize=6.8, rotation=25)
-        ax_b.set_yscale("log", base=10)
-        ax_b.set_xticks(x)
-        ax_b.set_xticklabels(pol_names, rotation=20, ha="right", fontsize=8.5)
-        ax_b.set_ylabel("Mean Regret (%, log10 scale)")
-        ax_b.set_title("Strategy & Ablation Comparison: " + REGRET_FORMULA, fontsize=10.5)
-        ax_b.grid(axis="y", which="both", ls=":", alpha=0.6)
-        ax_b.legend(fontsize=8.8)
-        fig_b.tight_layout()
-        fig_b.savefig(res_dir / "regret_policies_bar.png")
-        plt.close(fig_b)
+    res_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("results")
+    bw, wv = sorted(res_dir.glob("*_bw.csv")), sorted(res_dir.glob("*_wave.csv"))
+    js, ph = sorted(res_dir.glob("*_full.json")), sorted(res_dir.glob("*_phase_MR.csv"))
+    if bw:
+        plot_bw(res_dir, bw, False)
+        plot_bw(res_dir, bw, True)
+    if wv:
+        plot_waves(res_dir, wv)
+    if js:
+        plot_mb1_ols(res_dir, js)
+        plot_mb3_mb4_abs(res_dir, js)
+        plot_mb6_ols(res_dir, js)
+        plot_dashboard(res_dir, js)
+    if ph:
+        plot_phase_maps(res_dir, ph)
 
 
 if __name__ == "__main__":
